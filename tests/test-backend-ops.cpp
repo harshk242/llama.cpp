@@ -6623,6 +6623,41 @@ struct test_soft_max : public test_case {
     }
 };
 
+// GGML_OP_SOFT_MAX followed by a cast to f16 (fused by some backends)
+struct test_soft_max_f16 : public test_case {
+    const std::array<int64_t, 4> ne;
+    const int64_t nh;
+    const float scale;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SOFT_MAX_F16";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR3(ne, nh, scale);
+    }
+
+    double max_nmse_err() override {
+        return 1e-6;
+    }
+
+    test_soft_max_f16(std::array<int64_t, 4> ne = {10, 5, 1, 1}, int64_t nh = 4, float scale = 1.0f)
+        : ne(ne), nh(nh), scale(scale) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne[0], ne[1], nh, 1);
+        ggml_set_name(a, "a");
+        ggml_tensor * mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, ne[0], ne[1], 1, 1);
+        ggml_set_name(mask, "mask");
+        ggml_tensor * sm = ggml_soft_max_ext(ctx, a, mask, scale, 0.0f);
+        ggml_set_name(sm, "sm");
+        ggml_tensor * out = ggml_cast(ctx, sm, GGML_TYPE_F16);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_SOFT_MAX_BACK
 struct test_soft_max_back : public test_case {
     const ggml_type type;
@@ -10682,6 +10717,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         return test_cases;
     }
     if (getenv("GLM_SM_PERF")) {
+        for (int kv : {7, 512, 1025, 8448, 16384, 16896, 33280, 65536}) {
+            test_cases.emplace_back(new test_soft_max_f16({kv, 33, 1, 1}, 5, 0.1f));
+        }
         for (int kv : {8193, 8448, 16384, 16385, 16896, 25088, 32768, 33280, 40960, 40961, 65280}) {
             test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {kv, 64, 1, 1}, true, false, GGML_TYPE_F16, {20, 1}, 0.1f, 0.0f, false));
             test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {kv, 8, 1, 1}, true, false, GGML_TYPE_F32, {3, 1}, 1.0f, 0.0f, false));
@@ -13708,6 +13746,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         // KQ softmax shapes of GLM-4.7-Flash non-FA prefill: [n_kv, 512 tokens, 20 heads], f16 mask broadcast over heads
         for (int kv : {8448, 16384, 16896, 25088, 33280, 40960, 65280}) {
             test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {kv, 512, 1, 1}, true, false, GGML_TYPE_F16, {20, 1}, 0.1f, 0.0f, false));
+            test_cases.emplace_back(new test_soft_max_f16({kv, 512, 1, 1}, 20, 0.1f));
         }
         return test_cases;
     }

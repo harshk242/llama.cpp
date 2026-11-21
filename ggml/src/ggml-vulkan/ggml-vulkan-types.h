@@ -934,6 +934,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_soft_max_f32_wg512, pipeline_soft_max_f32_f16_wg512;
     // long-row single-pass softmax, 512 threads x N cached values; index 0..2 = N 64/80/128
     vk_pipeline pipeline_soft_max_big_f32[3], pipeline_soft_max_big_f32_f16[3];
+    // f16 mask and f16 output
+    vk_pipeline pipeline_soft_max_f32_f16_f16, pipeline_soft_max_f32_f16_f16_wg512, pipeline_soft_max_big_f32_f16_f16[3];
     vk_pipeline pipeline_soft_max_back_f32;
 
     vk_pipeline pipeline_soft_max_large1_f32, pipeline_soft_max_large1_f32_f16;
@@ -1340,6 +1342,8 @@ struct ggml_backend_vk_context {
     bool fused_topk_qsa {};
     bool fused_hc_post_gate {};
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};
+    // soft_max followed by a cast to f16
+    bool fused_soft_max_f16 {};
 
     // for GGML_VK_PERF_LOGGER
     std::unique_ptr<vk_perf_logger> perf_logger;
