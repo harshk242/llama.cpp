@@ -99,7 +99,11 @@ void soft_max(uint num_iters) {
         }
 
         if (idx < DATA_CACHE_SIZE) {
+#ifdef SOFT_MAX_BIG
+            data_cache[idx] = col < p.KX ? v : uintBitsToFloat(0xFF800000);
+#else
             data_cache[idx] = v;
+#endif
         }
     }
 
@@ -122,9 +126,13 @@ void soft_max(uint num_iters) {
     [[unroll]] for (uint col0 = 0, idx = 0; idx < num_iters; col0 += BLOCK_SIZE, ++idx) {
         const uint col = col0 + tid;
 
+        // Padded register entries contribute exp(-inf) = 0. Keep the cached
+        // loop straight-line so the compiler can scalarize its private array.
+#ifndef SOFT_MAX_BIG
         if (col >= p.KX) {
             break;
         }
+#endif
 
         // compute exp(a*scale+b*slope), add it to sum, and cache the new value
         // in data_cache if possible.
