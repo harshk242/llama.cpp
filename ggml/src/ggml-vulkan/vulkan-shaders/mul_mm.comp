@@ -326,10 +326,26 @@ void main() {
         ic = outer_tile - batch_idx * blocks_n;
     } else {
         const uint blocks_m = (p.M + BM - 1) / BM;
-        ic = gl_WorkGroupID.y;
-        batch_idx = gl_WorkGroupID.z + p.base_work_group_z;
-        ir = group_idx % blocks_m;
-        ik = group_idx / blocks_m;
+        const uint n_cols = gl_NumWorkGroups.y * gl_NumWorkGroups.z;
+        if (gl_NumWorkGroups.x == blocks_m && blocks_m >= 64 && n_cols >= 8) {
+            // Many row tiles and many column tiles (e.g. K x Q with K broadcast over heads):
+            // finish every column tile and batch for a group of row tiles, so the A tiles stay in cache.
+            const uint GM = 32;
+            const uint lin = gl_WorkGroupID.x + blocks_m * (gl_WorkGroupID.y + gl_NumWorkGroups.y * gl_WorkGroupID.z);
+            const uint g = lin / (GM * n_cols);
+            const uint r = lin - g * GM * n_cols;
+            const uint gm = min(GM, blocks_m - g * GM);
+            const uint col = r / gm;
+            ir = g * GM + r % gm;
+            ic = col % gl_NumWorkGroups.y;
+            batch_idx = col / gl_NumWorkGroups.y + p.base_work_group_z;
+            ik = 0;
+        } else {
+            ic = gl_WorkGroupID.y;
+            batch_idx = gl_WorkGroupID.z + p.base_work_group_z;
+            ir = group_idx % blocks_m;
+            ik = group_idx / blocks_m;
+        }
     }
 
     const uint i13 = fastdiv(batch_idx, p.ne12_mp, fastdiv_L(p.div_Ls1, 0));
