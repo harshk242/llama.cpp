@@ -1,0 +1,306 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_cooperative_matrix : enable
+
+// Single-token decode where all query heads share one K/V head (MLA).
+// Each workgroup walks rows_per_wg cache rows in chunks of C rows: S = Q K^T, softmax, O += P V.
+// It writes the unnormalized O with its row sum and reference max for flash_attn_split_k_reduce.
+// K and V tiles go through shared memory with wide loads from all threads.
+
+layout (local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout (constant_id = 0) const uint WG_SIZE = 256;
+layout (constant_id = 1) const uint HSK = 576;
+layout (constant_id = 2) const uint HSV = 512;
+layout (constant_id = 3) const uint C = 128;
+
+const uint TM = 8;
+const uint TN = 16;
+const uint TK = 16;
+const uint SG_SIZE = 16;
+const uint NSG = WG_SIZE / SG_SIZE;
+// Heads are padded to 3 blocks of TM. The host checks NH is in (2 * TM, 3 * TM].
+const uint HB = 3;
+const uint NHP = HB * TM;
+
+// QK: K is staged as [C rows][KS columns] slices. Each subgroup owns one block of TN rows and a part of each slice.
+const uint KS = 64;
+const uint K_STRIDE4 = (KS + 8) / 4;
+const uint QK_RBLK = C / TN;
+const uint QK_KPARTS = NSG / QK_RBLK;
+const uint QK_KSTEPS = KS / TK / QK_KPARTS;
+const uint K_LOADS = C * KS / 4 / WG_SIZE;
+
+// PV: V is staged transposed as [HSV columns][VR rows] slices, so V tiles load as column-major B.
+// Each thread transposes 4x4 blocks in registers. Each subgroup owns PV_DB blocks of TN output columns.
+const uint VR = TK;
+const uint VT_STRIDE4 = VR / 4;
+const uint VT_BLOCKS = VR * HSV / 16 / WG_SIZE;
+const uint PV_DB = HSV / TN / NSG;
+
+// The K slice is the larger tile for C >= 128.
+const uint STAGE4 = C * K_STRIDE4;
+
+// The reference max moves only when a chunk max exceeds it by this much. P = exp(S - ref) stays below exp(8) in f16.
+const float REF_MARGIN = 8.0f;
+
+layout (binding = 0) readonly buffer Q {float16_t data_q[];};
+layout (binding = 1) readonly buffer K {f16vec4 data_k4[];};
+layout (binding = 2) readonly buffer V {f16vec4 data_v4[];};
+layout (binding = 3) readonly buffer M {float16_t data_m[];};
+layout (binding = 4) writeonly buffer O {float data_o[];};
+
+layout (push_constant) uniform parameter {
+    uint KV;
+    uint NH;
+    uint k_stride;
+    uint v_stride;
+    uint n_split;
+    uint rows_per_wg;
+    float scale;
+} p;
+
+shared f16vec4 stage4[STAGE4];
+shared float s_sh[NHP * C];
+shared float16_t p_sh[NHP * C];
+shared float alpha_sh[NHP];
+shared uint rescale_sh;
+
+// Multiply each row of acc by alpha_sh[h0 + row] through shared memory.
+void scale_rows(inout coopmat<float, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator> acc, const uint h0, const uint scr) {
+    coopMatStore(acc, s_sh, scr, TN, gl_CooperativeMatrixLayoutRowMajor);
+    subgroupMemoryBarrierShared();
+    subgroupBarrier();
+    [[unroll]] for (uint i = 0; i < TM * TN / SG_SIZE; ++i) {
+        const uint e = i * SG_SIZE + gl_SubgroupInvocationID;
+        s_sh[scr + e] *= alpha_sh[h0 + e / TN];
+    }
+    subgroupMemoryBarrierShared();
+    subgroupBarrier();
+    coopMatLoad(acc, s_sh, scr, TN, gl_CooperativeMatrixLayoutRowMajor);
+    subgroupBarrier();
+}
+
+void main() {
+    const uint split = gl_WorkGroupID.x;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint sg = gl_SubgroupID;
+    const uint lane = gl_SubgroupInvocationID;
+    const uint row_begin = split * p.rows_per_wg;
+    const uint row_end = min(row_begin + p.rows_per_wg, p.KV);
+    const uint k_stride4 = p.k_stride / 4;
+    const uint v_stride4 = p.v_stride / 4;
+    const uint rb = sg % QK_RBLK;
+    const uint kp = sg / QK_RBLK;
+    const float NEG_FLT_MAX_OVER_2 = uintBitsToFloat(0xFEFFFFFF);
+
+    // Softmax state of heads sg and sg + NSG
+    float m_ref[2] = float[2](NEG_FLT_MAX_OVER_2, NEG_FLT_MAX_OVER_2);
+    float l_sum[2] = float[2](0.0f, 0.0f);
+
+    // One small array per head block keeps the accumulators in registers.
+    coopmat<float, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator> o0[PV_DB], o1[PV_DB], o2[PV_DB];
+    [[unroll]] for (uint db = 0; db < PV_DB; ++db) {
+        o0[db] = coopmat<float, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator>(0.0f);
+        o1[db] = coopmat<float, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator>(0.0f);
+        o2[db] = coopmat<float, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator>(0.0f);
+    }
+
+    f16vec4 kreg[K_LOADS];
+    [[unroll]] for (uint i = 0; i < K_LOADS; ++i) {
+        const uint idx = i * WG_SIZE + tid;
+        const uint r = idx / (KS / 4);
+        kreg[i] = row_begin + r < row_end ? data_k4[(row_begin + r) * k_stride4 + idx % (KS / 4)] : f16vec4(0.0);
+    }
+
+    for (uint c0 = row_begin; c0 < row_end; c0 += C) {
+        const uint n_valid = min(C, row_end - c0);
+
+        // S^T = Q K^T: rows are heads, columns are cache rows
+        coopmat<float, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator> s_acc[HB];
+        [[unroll]] for (uint hb = 0; hb < HB; ++hb) {
+            s_acc[hb] = coopmat<float, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator>(0.0f);
+        }
+
+        [[unroll]] for (uint ks = 0; ks < HSK; ks += KS) {
+            [[unroll]] for (uint i = 0; i < K_LOADS; ++i) {
+                const uint idx = i * WG_SIZE + tid;
+                stage4[(idx / (KS / 4)) * K_STRIDE4 + idx % (KS / 4)] = kreg[i];
+            }
+            barrier();
+
+            // Prefetch the next slice, or the first slice of the next chunk.
+            const uint next_row = ks + KS < HSK ? c0 : c0 + C;
+            const uint next_col = ks + KS < HSK ? (ks + KS) / 4 : 0;
+            [[unroll]] for (uint i = 0; i < K_LOADS; ++i) {
+                const uint idx = i * WG_SIZE + tid;
+                const uint r = next_row + idx / (KS / 4);
+                kreg[i] = r < row_end ? data_k4[r * k_stride4 + next_col + idx % (KS / 4)] : f16vec4(0.0);
+            }
+
+            [[unroll]] for (uint kk = 0; kk < QK_KSTEPS; ++kk) {
+                const uint k0 = (kp * QK_KSTEPS + kk) * TK;
+                coopmat<float16_t, gl_ScopeSubgroup, TK, TN, gl_MatrixUseB> k_mat;
+                coopMatLoad(k_mat, stage4, rb * TN * K_STRIDE4 + k0 / 4, K_STRIDE4, gl_CooperativeMatrixLayoutColumnMajor);
+                [[unroll]] for (uint hb = 0; hb < HB; ++hb) {
+                    coopmat<float16_t, gl_ScopeSubgroup, TM, TK, gl_MatrixUseA> q_mat;
+                    coopMatLoad(q_mat, data_q, hb * TM * HSK + ks + k0, HSK, gl_CooperativeMatrixLayoutRowMajor);
+                    s_acc[hb] = coopMatMulAdd(q_mat, k_mat, s_acc[hb]);
+                }
+            }
+            barrier();
+        }
+
+        // Sum the partial products of the subgroups that share a row block.
+        [[unroll]] for (uint part = QK_KPARTS - 1; part > 0; --part) {
+            if (kp == part) {
+                [[unroll]] for (uint hb = 0; hb < HB; ++hb) {
+                    coopMatStore(s_acc[hb], s_sh, hb * TM * C + rb * TN, C, gl_CooperativeMatrixLayoutRowMajor);
+                }
+            }
+            barrier();
+            if (kp == part - 1) {
+                [[unroll]] for (uint hb = 0; hb < HB; ++hb) {
+                    coopmat<float, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator> t;
+                    coopMatLoad(t, s_sh, hb * TM * C + rb * TN, C, gl_CooperativeMatrixLayoutRowMajor);
+                    s_acc[hb] = s_acc[hb] + t;
+                }
+            }
+            barrier();
+        }
+        if (kp == 0) {
+            [[unroll]] for (uint hb = 0; hb < HB; ++hb) {
+                coopMatStore(s_acc[hb], s_sh, hb * TM * C + rb * TN, C, gl_CooperativeMatrixLayoutRowMajor);
+            }
+        }
+        if (tid == 0) {
+            rescale_sh = 0;
+        }
+        barrier();
+
+        // Softmax against the reference max. Padded heads get zero probabilities.
+        [[unroll]] for (uint t = 0; t < 2; ++t) {
+            const uint h = sg + t * NSG;
+            if (h < p.NH) {
+                float s[C / SG_SIZE];
+                float m = NEG_FLT_MAX_OVER_2;
+                [[unroll]] for (uint i = 0; i < C / SG_SIZE; ++i) {
+                    const uint j = i * SG_SIZE + lane;
+                    s[i] = uintBitsToFloat(0xFF800000);
+                    if (j < n_valid) {
+                        s[i] = s_sh[h * C + j] * p.scale + float(data_m[c0 + j]);
+                    }
+                    m = max(m, s[i]);
+                }
+                m = subgroupMax(m);
+                float alpha = 1.0f;
+                if (m > m_ref[t] + REF_MARGIN) {
+                    alpha = exp(m_ref[t] - m);
+                    m_ref[t] = m;
+                    l_sum[t] *= alpha;
+                    if (c0 != row_begin) {
+                        rescale_sh = 1;
+                    }
+                }
+                if (lane == 0) {
+                    alpha_sh[h] = alpha;
+                }
+                float l = 0.0f;
+                [[unroll]] for (uint i = 0; i < C / SG_SIZE; ++i) {
+                    const float e = exp(s[i] - m_ref[t]);
+                    l += e;
+                    p_sh[h * C + i * SG_SIZE + lane] = float16_t(e);
+                }
+                l_sum[t] += subgroupAdd(l);
+            } else if (h < NHP) {
+                [[unroll]] for (uint i = 0; i < C / SG_SIZE; ++i) {
+                    p_sh[h * C + i * SG_SIZE + lane] = float16_t(0.0f);
+                }
+                if (lane == 0) {
+                    alpha_sh[h] = 1.0f;
+                }
+            }
+        }
+        barrier();
+
+        // Rare: a reference max moved, so rescale the earlier output rows. s_sh is free here.
+        if (rescale_sh != 0) {
+            const uint scr = sg * TM * TN;
+            [[unroll]] for (uint db = 0; db < PV_DB; ++db) {
+                scale_rows(o0[db], 0 * TM, scr);
+                scale_rows(o1[db], 1 * TM, scr);
+                scale_rows(o2[db], 2 * TM, scr);
+            }
+        }
+
+        // O += P V: rows are heads, columns are V features
+        [[unroll]] for (uint r0 = 0; r0 < C; r0 += VR) {
+            if (r0 < n_valid) {
+                [[unroll]] for (uint b = 0; b < VT_BLOCKS; ++b) {
+                    const uint blk = b * WG_SIZE + tid;
+                    const uint fg = blk % (HSV / 4);
+                    const uint rg = blk / (HSV / 4);
+                    f16vec4 v[4];
+                    [[unroll]] for (uint i = 0; i < 4; ++i) {
+                        v[i] = data_v4[(c0 + r0 + rg * 4 + i) * v_stride4 + fg];
+                    }
+                    [[unroll]] for (uint f = 0; f < 4; ++f) {
+                        stage4[(fg * 4 + f) * VT_STRIDE4 + rg] = f16vec4(v[0][f], v[1][f], v[2][f], v[3][f]);
+                    }
+                }
+                barrier();
+
+                coopmat<float16_t, gl_ScopeSubgroup, TM, TK, gl_MatrixUseA> p0, p1, p2;
+                coopMatLoad(p0, p_sh, 0 * TM * C + r0, C, gl_CooperativeMatrixLayoutRowMajor);
+                coopMatLoad(p1, p_sh, 1 * TM * C + r0, C, gl_CooperativeMatrixLayoutRowMajor);
+                coopMatLoad(p2, p_sh, 2 * TM * C + r0, C, gl_CooperativeMatrixLayoutRowMajor);
+                [[unroll]] for (uint db = 0; db < PV_DB; ++db) {
+                    const uint d0 = (db * NSG + sg) * TN;
+                    coopmat<float16_t, gl_ScopeSubgroup, TK, TN, gl_MatrixUseB> v_mat;
+                    coopMatLoad(v_mat, stage4, d0 * VT_STRIDE4, VT_STRIDE4, gl_CooperativeMatrixLayoutColumnMajor);
+                    o0[db] = coopMatMulAdd(p0, v_mat, o0[db]);
+                    o1[db] = coopMatMulAdd(p1, v_mat, o1[db]);
+                    o2[db] = coopMatMulAdd(p2, v_mat, o2[db]);
+                }
+                barrier();
+            }
+        }
+    }
+
+    const uint stats_base = p.n_split * p.NH * HSV + split * 2 * p.NH;
+    [[unroll]] for (uint t = 0; t < 2; ++t) {
+        const uint h = sg + t * NSG;
+        if (h < p.NH && lane == 0) {
+            data_o[stats_base + h] = l_sum[t];
+            data_o[stats_base + p.NH + h] = m_ref[t];
+        }
+    }
+
+    // Heads 0-15 go straight to memory. Heads 16-23 can include padding, so stage them in s_sh.
+    const uint o_base = split * p.NH * HSV;
+    [[unroll]] for (uint db = 0; db < PV_DB; ++db) {
+        const uint d0 = (db * NSG + sg) * TN;
+        coopMatStore(o0[db], data_o, o_base + 0 * TM * HSV + d0, HSV, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatStore(o1[db], data_o, o_base + 1 * TM * HSV + d0, HSV, gl_CooperativeMatrixLayoutRowMajor);
+    }
+    const uint rows = p.NH - 2 * TM;
+    const uint stage = sg * PV_DB * TM * TN;
+    [[unroll]] for (uint db = 0; db < PV_DB; ++db) {
+        coopMatStore(o2[db], s_sh, stage + db * TM * TN, TN, gl_CooperativeMatrixLayoutRowMajor);
+    }
+    subgroupMemoryBarrierShared();
+    subgroupBarrier();
+    for (uint idx = lane; idx < PV_DB * rows * TN; idx += SG_SIZE) {
+        const uint db = idx / (rows * TN);
+        const uint r = (idx / TN) % rows;
+        const uint c = idx % TN;
+        const uint d0 = (db * NSG + sg) * TN;
+        data_o[o_base + (2 * TM + r) * HSV + d0 + c] = s_sh[stage + db * TM * TN + r * TN + c];
+    }
+}
