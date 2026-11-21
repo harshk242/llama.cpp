@@ -1,0 +1,107 @@
+#version 450
+
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#if USE_SUBGROUP_ADD || USE_SUBGROUP_ADD_NO_SHMEM
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_shader_subgroup_ballot : require
+#define SHUFFLE_SCALES 1
+// value of thread c of the 16-thread group. On Intel Xe a broadcast from a constant lane is much cheaper than a shuffle.
+#define GROUP_LANE(v, c) (gl_SubgroupSize == 16 ? subgroupBroadcast(v, c) : subgroupShuffle(v, (gl_SubgroupInvocationID & ~15u) + c))
+#endif
+
+#include "mul_mat_vec_base.glsl"
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+// A q8_0 block is 17 16-bit words: d, then 16 words with 2 quants each.
+// 16 threads share a group of 16 blocks. Thread t reads quant word t of each block, so the loads are contiguous.
+// Thread t also reads d of block t and shares it through the subgroup: a load of the same d by all threads is slow on Intel Xe.
+layout (binding = 0) readonly buffer A_U16 {uint16_t data_a_u16[];};
+layout (binding = 0) readonly buffer A_F16 {float16_t data_a_f16[];};
+
+#define WORDS_PER_BLOCK 17
+
+FLOAT_TYPE temp[NUM_COLS][NUM_ROWS];
+
+void calc_blocks(const uint blk0, const uint nb, const uint itid, const uint row_w0, const uint nw_row, const uint b_offset, const uint num_rows, const bool full) {
+#ifdef SHUFFLE_SCALES
+    FLOAT_TYPE dsh[NUM_ROWS][16];
+    [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+        const FLOAT_TYPE dl = FLOAT_TYPE(data_a_f16[row_w0 + n * nw_row + min(blk0 + itid, nb - 1) * WORDS_PER_BLOCK]);
+        dsh[n][ 0] = GROUP_LANE(dl,  0); dsh[n][ 1] = GROUP_LANE(dl,  1); dsh[n][ 2] = GROUP_LANE(dl,  2); dsh[n][ 3] = GROUP_LANE(dl,  3);
+        dsh[n][ 4] = GROUP_LANE(dl,  4); dsh[n][ 5] = GROUP_LANE(dl,  5); dsh[n][ 6] = GROUP_LANE(dl,  6); dsh[n][ 7] = GROUP_LANE(dl,  7);
+        dsh[n][ 8] = GROUP_LANE(dl,  8); dsh[n][ 9] = GROUP_LANE(dl,  9); dsh[n][10] = GROUP_LANE(dl, 10); dsh[n][11] = GROUP_LANE(dl, 11);
+        dsh[n][12] = GROUP_LANE(dl, 12); dsh[n][13] = GROUP_LANE(dl, 13); dsh[n][14] = GROUP_LANE(dl, 14); dsh[n][15] = GROUP_LANE(dl, 15);
+    }
+#endif
+
+    [[unroll]] for (uint bb = 0; bb < 16; ++bb) {
+        const uint blk = blk0 + bb;
+        if (!full && blk >= nb) {
+            break;
+        }
+
+        vec2 bv[NUM_COLS];
+        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+            bv[j] = vec2(data_b_v2[(j * p.batch_stride_b + b_offset + blk * QUANT_K + 2 * itid) / 2]);
+        }
+
+        [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+            const uint bw = row_w0 + n * nw_row + blk * WORDS_PER_BLOCK;
+            const int qw = int(data_a_u16[bw + 1 + itid]);
+#ifdef SHUFFLE_SCALES
+            const FLOAT_TYPE d = dsh[n][bb];
+#else
+            const FLOAT_TYPE d = FLOAT_TYPE(data_a_f16[bw]);
+#endif
+            const vec2 q = vec2(bitfieldExtract(qw, 0, 8), bitfieldExtract(qw, 8, 8));
+            [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+                temp[j][n] = fma(d, FLOAT_TYPE(dot(q, bv[j])), temp[j][n]);
+            }
+        }
+    }
+}
+
+void compute_outputs(const uint first_row, const uint num_rows) {
+    uint a_offset, b_offset, d_offset;
+    get_offsets(a_offset, b_offset, d_offset);
+
+    const uint nb = p.ncols / QUANT_K;
+    const uint nw_row = nb * WORDS_PER_BLOCK;
+    const uint row_w0 = (a_offset + first_row * nb) * WORDS_PER_BLOCK;
+
+    const uint tid = gl_LocalInvocationID.x;
+    const uint itid = tid % 16;
+    const uint ix = tid / 16;
+    const uint it_size = gl_WorkGroupSize.x / 16;
+
+    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+            temp[j][n] = FLOAT_TYPE(0);
+        }
+    }
+
+    uint blk0 = 16 * ix;
+    for (; blk0 + 16 <= nb; blk0 += 16 * it_size) {
+        calc_blocks(blk0, nb, itid, row_w0, nw_row, b_offset, num_rows, true);
+    }
+    if (blk0 < nb) {
+        calc_blocks(blk0, nb, itid, row_w0, nw_row, b_offset, num_rows, false);
+    }
+
+    reduce_result(temp, d_offset, first_row, num_rows, tid);
+}
+
+void main() {
+    const uint first_row = NUM_ROWS * (gl_WorkGroupID.x + gl_NumWorkGroups.x * gl_WorkGroupID.z);
+
+    // do NUM_ROWS at a time, unless there aren't enough remaining rows
+    if (first_row + NUM_ROWS <= p.stride_d) {
+        compute_outputs(first_row, NUM_ROWS);
+    } else {
+        if (first_row >= p.stride_d) {
+            return;
+        }
+        compute_outputs(first_row, p.stride_d - first_row);
+    }
+}

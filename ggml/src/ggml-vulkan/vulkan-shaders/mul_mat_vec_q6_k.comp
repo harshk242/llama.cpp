@@ -1,77 +1,84 @@
 #version 450
 
 #extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#if USE_SUBGROUP_ADD || USE_SUBGROUP_ADD_NO_SHMEM
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_shader_subgroup_ballot : require
+#define SHUFFLE_SCALES 1
+// value of thread c of the 16-thread group. On Intel Xe a broadcast from a constant lane is much cheaper than a shuffle.
+#define GROUP_LANE(v, c) (gl_SubgroupSize == 16 ? subgroupBroadcast(v, c) : subgroupShuffle(v, (gl_SubgroupInvocationID & ~15u) + c))
+#endif
 
 #include "mul_mat_vec_base.glsl"
 
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
-shared FLOAT_TYPE sccache[2][BLOCK_SIZE/16][16];
+// A q6_K block is 105 16-bit words: ql[64], qh[32], scales[8], d.
+// 16 threads share a block. For each 128-value half h, thread t reads ql words 32h+t and 32h+16+t
+// and qh word 16h+t, so the loads of the 16 threads are contiguous.
+// The scales and d are read once per block by threads 0..8 and shared through the subgroup:
+// a load of the same scale word by all threads is much slower on Intel Xe.
+layout (binding = 0) readonly buffer A_U16 {uint16_t data_a_u16[];};
+layout (binding = 0) readonly buffer A_F16 {float16_t data_a_f16[];};
+
+#define WORDS_PER_BLOCK 105
+#define QH_WORD 64
+#define SCALES_WORD 96
+#define D_WORD 104
 
 FLOAT_TYPE temp[NUM_COLS][NUM_ROWS];
-uint csel = 0;
 
-void calc_superblock(const uint a_offset, const uint b_offset, const uint itid, const uint ix, const uint ql_offset, const uint qh_offset, const uint s_offset, const uint y_offset, const uint i, const uint num_blocks_per_row, const uint first_row, const uint num_rows, const bool all_threads) {
-    const uint y_idx = i * QUANT_K + y_offset;
+void calc_block(const uint ib, const uint itid, const uint row_w0, const uint nw_row, const uint b_offset, const uint num_rows) {
+    const uint is = itid / 8;
+    const uint y_idx = ib * QUANT_K + 2 * itid;
+
+    vec2 by[NUM_COLS][8];
+    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+        [[unroll]] for (uint m = 0; m < 8; ++m) {
+            by[j][m] = vec2(data_b_v2[(j * p.batch_stride_b + b_offset + y_idx + 32 * m) / 2]);
+        }
+    }
 
     [[unroll]] for (uint n = 0; n < num_rows; ++n) {
-        const uint ib0 = a_offset + (first_row+n)*num_blocks_per_row;
-        csel ^= 1;
+        const uint bw = row_w0 + n * nw_row + ib * WORDS_PER_BLOCK;
 
-        if (!all_threads) { // when we don't have enough blocks to use all threads
-            if (i < num_blocks_per_row)
-                sccache[csel][ix][itid] = FLOAT_TYPE(data_a[ib0 + i].scales[itid]);
-            barrier();
+#ifdef SHUFFLE_SCALES
+        const uint sd_word = uint(data_a_u16[bw + SCALES_WORD + min(itid, 8)]);
+        const uint sc_words[8] = {GROUP_LANE(sd_word, 0), GROUP_LANE(sd_word, 1), GROUP_LANE(sd_word, 2), GROUP_LANE(sd_word, 3),
+                                  GROUP_LANE(sd_word, 4), GROUP_LANE(sd_word, 5), GROUP_LANE(sd_word, 6), GROUP_LANE(sd_word, 7)};
+        const FLOAT_TYPE d = FLOAT_TYPE(unpackHalf2x16(GROUP_LANE(sd_word, 8)).x);
+#else
+        const FLOAT_TYPE d = FLOAT_TYPE(data_a_f16[bw + D_WORD]);
+#endif
 
-            if (i >= num_blocks_per_row)
-                continue;
-        }
+        [[unroll]] for (uint h = 0; h < 2; ++h) {
+            const uint32_t ql = uint32_t(data_a_u16[bw + 32 * h + itid]) | (uint32_t(data_a_u16[bw + 32 * h + 16 + itid]) << 16);
+            const uint32_t qh = uint32_t(data_a_u16[bw + QH_WORD + 16 * h + itid]) * 0x00010001u;
 
-        const uint32_t ql0_u32 =  uint32_t(data_a_packed16[ib0 + i].ql[ql_offset / 2]) | (uint32_t(data_a_packed16[ib0 + i].ql[ql_offset / 2 + 1]) << 16);
-        const uint32_t ql32_u32 = uint32_t(data_a_packed16[ib0 + i].ql[ql_offset / 2 + 16]) | (uint32_t(data_a_packed16[ib0 + i].ql[ql_offset / 2 + 17]) << 16);
+            // bytes: values l, l+1 (low nibble of ql) and l+32, l+33 (low nibble of ql+32), then the same + 64 for the high nibbles
+            const uint32_t q_lo = (ql & 0x0F0F0F0F) | ((qh & 0x00000303) << 4) | ((qh & 0x0C0C0000) << 2);
+            const uint32_t q_hi = ((ql >> 4) & 0x0F0F0F0F) | (qh & 0x00003030) | ((qh & 0xC0C00000) >> 2);
+            const vec4 v_lo = vec4(unpack8(q_lo)) - 32;
+            const vec4 v_hi = vec4(unpack8(q_hi)) - 32;
 
-        const uint32_t ql0_u32_lo4 = ql0_u32 & 0x0F0F0F0F;
-        const uint32_t ql0_u32_hi4 = (ql0_u32 >> 4) & 0x0F0F0F0F;
-        const uint32_t ql32_u32_lo4 = ql32_u32 & 0x0F0F0F0F;
-        const uint32_t ql32_u32_hi4 = (ql32_u32 >> 4) & 0x0F0F0F0F;
-
-        const uint32_t qh_u32 = uint32_t(data_a_packed16[ib0 + i].qh[qh_offset / 2]) | (uint32_t(data_a_packed16[ib0 + i].qh[qh_offset / 2 + 1]) << 16);
-        const uint32_t qh0_u32 = (qh_u32 & 0x03030303) << 4;
-        const uint32_t qh2_u32 = (qh_u32 & 0x0C0C0C0C) << 2;
-        const uint32_t qh4_u32 = (qh_u32 & 0x30303030);
-        const uint32_t qh6_u32 = (qh_u32 & 0xC0C0C0C0) >> 2;
-
-        const uint32_t q0_u32 = ql0_u32_lo4  | qh0_u32;
-        const uint32_t q1_u32 = ql32_u32_lo4 | qh2_u32;
-        const uint32_t q2_u32 = ql0_u32_hi4  | qh4_u32;
-        const uint32_t q3_u32 = ql32_u32_hi4 | qh6_u32;
-
-        const vec4 q0 = vec4(unpack8(q0_u32)) - 32;
-        const vec4 q1 = vec4(unpack8(q1_u32)) - 32;
-        const vec4 q2 = vec4(unpack8(q2_u32)) - 32;
-        const vec4 q3 = vec4(unpack8(q3_u32)) - 32;
-
-        if (all_threads) {
-            sccache[csel][ix][itid] = FLOAT_TYPE(data_a[ib0 + i].scales[itid]);
-            barrier();
-        }
-
-        const FLOAT_TYPE d = FLOAT_TYPE(data_a[ib0 + i].d);
-
-        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
-            vec4 by0  = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + y_idx) / 4     ]);
-            vec4 by32 = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + y_idx) / 4 +  8]);
-            vec4 by64 = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + y_idx) / 4 + 16]);
-            vec4 by96 = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + y_idx) / 4 + 24]);
-
-            FLOAT_TYPE sum[4] = {0, 0, 0, 0};
-            [[unroll]] for (uint l = 0; l < 4; ++l) {
-                sum[0] = fma(FLOAT_TYPE(by0[l]), q0[l], sum[0]);
-                sum[1] = fma(FLOAT_TYPE(by32[l]), q1[l], sum[1]);
-                sum[2] = fma(FLOAT_TYPE(by64[l]), q2[l], sum[2]);
-                sum[3] = fma(FLOAT_TYPE(by96[l]), q3[l], sum[3]);
+            uint sc_word[4];
+            [[unroll]] for (uint m = 0; m < 4; ++m) {
+#ifdef SHUFFLE_SCALES
+                sc_word[m] = sc_words[4 * h + m];
+#else
+                sc_word[m] = uint(data_a_u16[bw + SCALES_WORD + 4 * h + m]);
+#endif
             }
-            temp[j][n] = fma(fma(sum[0], sccache[csel][ix][s_offset], fma(sum[1], sccache[csel][ix][s_offset + 2], fma(sum[2], sccache[csel][ix][s_offset + 4], sum[3] * sccache[csel][ix][s_offset + 6]))), d, temp[j][n]);
+            const vec4 sc = vec4(
+                bitfieldExtract(int(sc_word[0]), int(8 * is), 8),
+                bitfieldExtract(int(sc_word[1]), int(8 * is), 8),
+                bitfieldExtract(int(sc_word[2]), int(8 * is), 8),
+                bitfieldExtract(int(sc_word[3]), int(8 * is), 8));
+
+            [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+                const vec4 s = vec4(dot(v_lo.xy, by[j][4 * h]), dot(v_lo.zw, by[j][4 * h + 1]), dot(v_hi.xy, by[j][4 * h + 2]), dot(v_hi.zw, by[j][4 * h + 3]));
+                temp[j][n] = fma(d, FLOAT_TYPE(dot(s, sc)), temp[j][n]);
+            }
         }
     }
 }
@@ -81,23 +88,13 @@ void compute_outputs(const uint first_row, const uint num_rows) {
     get_offsets(a_offset, b_offset, d_offset);
 
     const uint num_blocks_per_row = p.ncols / QUANT_K;
+    const uint nw_row = num_blocks_per_row * WORDS_PER_BLOCK;
+    const uint row_w0 = (a_offset + first_row * num_blocks_per_row) * WORDS_PER_BLOCK;
 
-    // 16 threads are used to process each block
-    const uint it_size = gl_WorkGroupSize.x/16;
     const uint tid = gl_LocalInvocationID.x;
-    const uint itid = tid%16;  // 0...15
-    const uint ix = tid/16;
-
-    const uint v_im = itid/8;                               // 0 or 1. 0 computes 0..., 1 computes 128...
-    const uint v_in = itid - 8*v_im;                        // 0...7
-
-    const uint l0 = 4 * v_in;                               // 0, 4, 8, ..., 28
-    const uint is = v_in / 4;
-
-    const uint ql_offset = 64*v_im + l0;
-    const uint qh_offset = 32*v_im + l0;
-    const uint s_offset  =  8*v_im + is;
-    const uint y_offset = 128*v_im + l0;
+    const uint itid = tid % 16;
+    const uint ix = tid / 16;
+    const uint it_size = gl_WorkGroupSize.x / 16;
 
     [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
         [[unroll]] for (uint i = 0; i < NUM_ROWS; ++i) {
@@ -105,12 +102,9 @@ void compute_outputs(const uint first_row, const uint num_rows) {
         }
     }
 
-    const uint nbr_par_th = num_blocks_per_row%it_size;
-    const uint nbr_all_th = num_blocks_per_row - nbr_par_th;
-    uint i0 = 0;
-    [[unroll]] for (; i0 < nbr_all_th; i0 += it_size)
-        calc_superblock(a_offset, b_offset, itid, ix, ql_offset, qh_offset, s_offset, y_offset, i0 + ix, num_blocks_per_row, first_row, num_rows, true);
-    calc_superblock(a_offset, b_offset, itid, ix, ql_offset, qh_offset, s_offset, y_offset, i0 + ix, num_blocks_per_row, first_row, num_rows, false);
+    for (uint ib = ix; ib < num_blocks_per_row; ib += it_size) {
+        calc_block(ib, itid, row_w0, nw_row, b_offset, num_rows);
+    }
 
     reduce_result(temp, d_offset, first_row, num_rows, tid);
 }
