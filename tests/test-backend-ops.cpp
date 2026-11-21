@@ -14001,6 +14001,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
         return test_cases;
     }
+    if (getenv("GLM_MV_PERF")) {
+        // decode mat-vec shapes of GLM-4.7-Flash UD-Q5_K_XL (q5_K as reference)
+        for (ggml_type t : {GGML_TYPE_Q8_0, GGML_TYPE_Q6_K, GGML_TYPE_Q5_K}) {
+            test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 1536, 1, 2048, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 2048, 1, 1536, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 5120, 1, 768, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 576, 1, 2048, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 256, 1, 512, {20, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 154880, 1, 2048, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 2048, 1, 10240, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, 64, 4, false, 1536, 1, 2048));
+            test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, 64, 4, false, 2048, 1, 1536));
+        }
+        // q8_0 rows of 192 values (204 bytes, not 4-byte aligned)
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 512, 1, 192, {20, 1}, {1, 1}));
+        return test_cases;
+    }
     if (getenv("GLM_BW_PERF")) {
         // 32768 x 576 f16 = 37.7 MB, the K cache of one layer at 32K
         test_cases.emplace_back(new test_cpy(GGML_TYPE_F16, GGML_TYPE_F16, {576, 32768, 1, 1}));
