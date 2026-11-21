@@ -18,8 +18,6 @@ layout (binding = 2) readonly buffer MAX {float data_max[];};
 layout (binding = 3) readonly buffer S {float data_s[];};
 layout (binding = 4) buffer OV4 {vec4 data_ov4[];};
 
-layout (binding = 4) writeonly buffer Stats {float data_stats[];};
-
 layout (push_constant) uniform parameter
 {
     uint neq1;
@@ -115,26 +113,20 @@ void main() {
     const uint lane = gl_SubgroupInvocationID;
     const uint head_v_idx = gl_WorkGroupID.y;
     const uint batch_v_ratio = p.neq3 / p.nev3;
-    // A zero specialization keeps the original single-dispatch output path.
-    const uint chunk = Flags >> 8;
-    const uint split = chunk != 0 ? gl_WorkGroupID.z : 0;
-    const uint kv_start = split * chunk;
-    const uint kv_len = chunk != 0 ? min(chunk, p.nek1 - kv_start) : p.nek1;
-    const uint batch_idx = chunk != 0 ? 0 : gl_WorkGroupID.z;
+    const uint batch_idx = gl_WorkGroupID.z;
     const uint batch_v_idx = batch_idx / batch_v_ratio;
     const uint v_idx = gl_WorkGroupID.x % v_head_wgs;
     const uint out_row_idx = gl_WorkGroupID.x / v_head_wgs;
     const uint sg = gl_SubgroupID;
     const uint wg_lane = sg * SubGroupSize + lane;
     const uint max_dim = (p.nek1 + p_reduce - 1) / p_reduce;
-    const uint local_max_dim = (kv_len + p_reduce - 1) / p_reduce;
     const uint p_dim = max_dim * p_reduce;
     const uint v_dim = p.nbv1;
     const uint o_dim = p.neq2 * HSV;
-    const uint p_base = (batch_idx * p.neq1 * p.neq2 + head_v_idx * gqa_ratio + out_row_idx * Wr * p.neq2) * p_dim / 4 + kv_start / 4;
-    const uint max_base = (batch_idx * p.neq1 * p.neq2 + head_v_idx * gqa_ratio + out_row_idx * Wr * p.neq2) * max_dim + kv_start / p_reduce;
-    const uint v_base = batch_v_idx * p.nbv3 + head_v_idx * p.nbv2 + v_idx * Bc + (kv_start + sg * TK) * v_dim;
-    const uint o_base = split * o_dim / 4 + (batch_idx * p.nb3 + v_idx * Bc + head_v_idx * gqa_ratio * HSV + out_row_idx * o_dim * Wr) / 4;
+    const uint p_base = (batch_idx * p.neq1 * p.neq2 + head_v_idx * gqa_ratio + out_row_idx * Wr * p.neq2) * p_dim / 4;
+    const uint max_base = (batch_idx * p.neq1 * p.neq2 + head_v_idx * gqa_ratio + out_row_idx * Wr * p.neq2) * max_dim;
+    const uint v_base = batch_v_idx * p.nbv3 + head_v_idx * p.nbv2 + v_idx * Bc + sg * TK * v_dim;
+    const uint o_base = (batch_idx * p.nb3 + v_idx * Bc + head_v_idx * gqa_ratio * HSV + out_row_idx * o_dim * Wr) / 4;
     const uint psh_offset = psh_base + wg_lane * 4;
     const float NEG_FLT_MAX_OVER_2 = uintBitsToFloat(0xFEFFFFFF);
     const float POS_FLT_MAX_OVER_2 = uintBitsToFloat(0x7EFFFFFF);
@@ -188,8 +180,8 @@ void main() {
         if (tok_idx < Wr) {
             float Maxf = NEG_FLT_MAX_OVER_2;
             const uint max_offset = max_base + (tok_idx * p.neq2 + row_idx) * max_dim;
-            [[unroll]] for (uint max_reduce = 0; max_reduce < (local_max_dim + SubGroupSize - 1) / SubGroupSize; ++max_reduce) {
-                if (max_reduce * SubGroupSize + lane < local_max_dim) {
+            [[unroll]] for (uint max_reduce = 0; max_reduce < (max_dim + SubGroupSize - 1) / SubGroupSize; ++max_reduce) {
+                if (max_reduce * SubGroupSize + lane < max_dim) {
                     Maxf = max(Maxf, data_max[max_offset + max_reduce * SubGroupSize + lane]);
                 }
             }
@@ -265,7 +257,7 @@ void main() {
         p_col_base[idx] = p_col_base[idx] + p_v4;
     }
 
-    const uint loop_count = seq_boundary_check ? ((p.nek1 + p_per_loop - 1) / p_per_loop - 1) : (kv_len / p_per_loop);
+    const uint loop_count = seq_boundary_check ? ((p.nek1 + p_per_loop - 1) / p_per_loop - 1) : (p.nek1 / p_per_loop);
     uint sh_pingpong_load = 0;
     uint sh_pingpong_store = 0;
 
@@ -408,18 +400,7 @@ void main() {
 
         subgroupBarrier();
 
-        if (chunk != 0) {
-            // The split-K reducer consumes unnormalized O, the local sum and max.
-            const uint stats_base = gl_NumWorkGroups.z * o_dim + split * 2 * p.neq2;
-            [[unroll]] for (uint r = 0; r < o_scalar_row; ++r) {
-                const uint head = r * SubGroupSize + lane;
-                if (v_idx == 0 && o_mask[r]) {
-                    data_stats[stats_base + head] = Lfrcp_temp[r][0];
-                    data_stats[stats_base + p.neq2 + head] = F32Poolsh.F32sh[global_maxsh_offset + head];
-                }
-                F32Poolsh.F32sh[lfsh_offset + head] = 1.0f;
-            }
-        } else if ((p.flag & SINK_ENABLE_BIT) != 0) {
+        if ((p.flag & SINK_ENABLE_BIT) != 0) {
             [[unroll]] for (uint r = 0; r < o_scalar_row; ++r) {
                 float Mf = F32Poolsh.F32sh[global_maxsh_offset + r * SubGroupSize + lane];
                 float sink_emf = Mf - sink[r];

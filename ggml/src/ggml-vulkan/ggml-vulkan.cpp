@@ -1618,12 +1618,6 @@ static vk_xe_fa_tuning_params get_xe_fa_tuning_params(const vk_device_struct * d
         uint32_t aligned_pv_ratio = upper_power_of_2(pv_ratio);
         uint32_t split_p_per_iter_ph2 = (pv_ratio <= 32) ? 256 : 128;
         uint32_t out_col_per_wg_ph2 = intel_gpu ? (pv_ratio > 16 ? 8 : 16) : 16;
-        if (pipeline_state.kv_chunk) {
-            // A wider output tile shares each staged probability across more V
-            // columns. Halve the sequence tile to keep shared memory bounded.
-            split_p_per_iter_ph2 = 128;
-            out_col_per_wg_ph2 = 16;
-        }
         uint32_t split_p_per_warp = 16;
         uint32_t group_sz_ph2 = (split_p_per_iter_ph2 / split_p_per_warp) * sg_sz;
         sg_per_gw = group_sz_ph2 / sg_sz;
@@ -1658,7 +1652,7 @@ static vk_xe_fa_tuning_params get_xe_fa_tuning_params(const vk_device_struct * d
         params.decode_params.split_p_per_iter_ph2 = split_p_per_iter_ph2;
         params.decode_params.out_row_per_wg_ph2 = out_row_per_wg_ph2;
         params.decode_params.out_col_per_wg_ph2 = out_col_per_wg_ph2;
-        params.decode_params.pipeline_flag_ph2 = (pipeline_state.kv_chunk << 8) | uint32_t(pipeline_state.unaligned_seq_len);
+        params.decode_params.pipeline_flag_ph2 = pipeline_state.unaligned_seq_len ? (1u << 0) : 0;
     }
 
     if (shmem_sz > device->properties.limits.maxComputeSharedMemorySize) {
@@ -9089,13 +9083,6 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     size_t size_group_max = 0;
     size_t size_decode_temp = 0;
     uint32_t pv_ratio = uint32_t(neq2 / nev2);
-    // One query over the shared MLA head otherwise leaves just 64 workgroups
-    // scanning the entire cache. Reduce independent sequence tiles afterwards.
-    constexpr uint32_t xe_decode_chunk = 4096;
-    const bool xe_split_decode = vk_dev->vendor_id == VK_VENDOR_ID_INTEL && vk_dev->properties.deviceID == 0xB082 &&
-        neq1 == 1 && neq2 == 20 && neq3 == 1 && nek2 == 1 && nev2 == 1 &&
-        HSK == 576 && HSV == 512 && !sinks && KV >= 8192 && KV <= 65536 && KV % 256 == 0;
-
     vk_xe_fa_tuning_params xe_fa_params {};
 
     {
@@ -9123,7 +9110,6 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
                 }
             } else {
                 vk_xe_fa_pipeline_state decode_state = { (uint32_t)neq0, (uint32_t)nev0, qk_ratio, pv_ratio, (uint32_t)neq1, false, false, false, false };
-                decode_state.kv_chunk = xe_split_decode ? xe_decode_chunk : 0;
                 decode_state.unaligned_seq_len = nek1 % 256 != 0;
                 xe_fa_params = get_xe_fa_tuning_params(vk_dev, decode_state, false);
                 const uint32_t split_p_size = xe_fa_params.decode_params.p_chunk_ph1;
@@ -9231,7 +9217,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     if (xe_fa_opt) {
         // Bypass mask_opt and split_k buffer grow when they are not in use
         use_mask_opt = false;
-        split_k = xe_fa_use_2phases && xe_split_decode ? CEIL_DIV(KV, xe_decode_chunk) : 1;
+        split_k = 1;
         if (xe_fa_use_2phases) {
             if (ctx->prealloc_size_x < size_decode_temp) {
                 ctx->prealloc_size_x = size_decode_temp;
@@ -9471,24 +9457,10 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
                 pc_xe_fa, { (uint32_t)ph1_wg, (uint32_t)nek1, (uint32_t)neq3 });
 
             ggml_vk_sync_buffers(ctx, subctx);
-            vk_subbuffer phase2_dst = dst_buf;
-            if (xe_split_decode) {
-                phase2_dst = ggml_vk_subbuffer(ctx, ctx->prealloc_split_k, 0);
-            }
             ggml_pipeline_request_descriptor_sets(ctx, xe_fa_pipeline_dual_phases.second, 1);
             ggml_vk_dispatch_pipeline(ctx, subctx, xe_fa_pipeline_dual_phases.second,
-                { p_temp_buf, v_buf, max_temp_buf, sinks_buf, phase2_dst },
-                pc_xe_fa, { (uint32_t)ph2_wg, (uint32_t)nev2, (uint32_t)neq3 * split_k });
-
-            if (xe_split_decode) {
-                ggml_vk_sync_buffers(ctx, subctx);
-                vk_pipeline reduce = ctx->device->pipeline_flash_attn_split_k_reduce;
-                ggml_pipeline_request_descriptor_sets(ctx, reduce, 1);
-                const vk_op_flash_attn_split_k_reduce_push_constants pc2 = { HSV, (uint32_t)ne1, 1, 1, split_k, 0 };
-                ggml_vk_dispatch_pipeline(ctx, subctx, reduce, {phase2_dst, sinks_buf, dst_buf}, pc2,
-                                          { (uint32_t)ne1, HSV, 1 });
-                ctx->prealloc_split_k_need_sync = true;
-            }
+                { p_temp_buf, v_buf, max_temp_buf, sinks_buf, dst_buf },
+                pc_xe_fa, { (uint32_t)ph2_wg, (uint32_t)nev2, (uint32_t)neq3 });
 
             ctx->prealloc_x_need_sync = true;
         } else {
