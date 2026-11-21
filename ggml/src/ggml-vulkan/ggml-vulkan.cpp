@@ -3952,6 +3952,19 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_soft_max_f32_wg512, "soft_max_f32_wg512", soft_max_f32_len, soft_max_f32_data, "main", 4, sizeof(vk_op_soft_max_push_constants), {1, 1, 1}, { 512 }, 1);
     ggml_vk_create_pipeline(device, device->pipeline_soft_max_f32_f16, "soft_max_f32_f16", soft_max_f32_f16_len, soft_max_f32_f16_data, "main", 4, sizeof(vk_op_soft_max_push_constants), {1, 1, 1}, { device->subgroup_size }, 1);
     ggml_vk_create_pipeline(device, device->pipeline_soft_max_f32_f16_wg512, "soft_max_f32_f16_wg512", soft_max_f32_f16_len, soft_max_f32_f16_data, "main", 4, sizeof(vk_op_soft_max_push_constants), {1, 1, 1}, { 512 }, 1);
+    {
+        static const char * sm_big_disable = getenv("GGML_VK_SOFTMAX_BIG_DISABLE");
+        if (!sm_big_disable) {
+            ggml_vk_create_pipeline(device, device->pipeline_soft_max_big_f32[0], "soft_max_big64_f32", soft_max_big64_f32_len, soft_max_big64_f32_data, "main", 4, sizeof(vk_op_soft_max_push_constants), {1, 1, 1}, { 512 }, 1);
+            ggml_vk_create_pipeline(device, device->pipeline_soft_max_big_f32_f16[0], "soft_max_big64_f32_f16", soft_max_big64_f32_f16_len, soft_max_big64_f32_f16_data, "main", 4, sizeof(vk_op_soft_max_push_constants), {1, 1, 1}, { 512 }, 1);
+            ggml_vk_create_pipeline(device, device->pipeline_soft_max_big_f32[1], "soft_max_big80_f32", soft_max_big80_f32_len, soft_max_big80_f32_data, "main", 4, sizeof(vk_op_soft_max_push_constants), {1, 1, 1}, { 512 }, 1);
+            ggml_vk_create_pipeline(device, device->pipeline_soft_max_big_f32_f16[1], "soft_max_big80_f32_f16", soft_max_big80_f32_f16_len, soft_max_big80_f32_f16_data, "main", 4, sizeof(vk_op_soft_max_push_constants), {1, 1, 1}, { 512 }, 1);
+            if (!getenv("GGML_VK_SOFTMAX_BIG128_DISABLE")) {
+                ggml_vk_create_pipeline(device, device->pipeline_soft_max_big_f32[2], "soft_max_big128_f32", soft_max_big128_f32_len, soft_max_big128_f32_data, "main", 4, sizeof(vk_op_soft_max_push_constants), {1, 1, 1}, { 512 }, 1);
+                ggml_vk_create_pipeline(device, device->pipeline_soft_max_big_f32_f16[2], "soft_max_big128_f32_f16", soft_max_big128_f32_f16_len, soft_max_big128_f32_f16_data, "main", 4, sizeof(vk_op_soft_max_push_constants), {1, 1, 1}, { 512 }, 1);
+            }
+        }
+    }
     ggml_vk_create_pipeline(device, device->pipeline_soft_max_back_f32, "soft_max_back_f32", soft_max_back_f32_len, soft_max_back_f32_data, "main", 3, sizeof(vk_op_push_constants), {1, 1, 1}, { device->subgroup_size }, 1, true);
 
     ggml_vk_create_pipeline(device, device->pipeline_soft_max_large1_f32,     "soft_max_large1_f32",     soft_max_large1_f32_len,     soft_max_large1_f32_data,     "main", 6, sizeof(vk_op_soft_max_push_constants), {1, 1, 1}, { 128, 4 }, 1, true);
@@ -9790,6 +9803,20 @@ static vk_pipeline ggml_vk_float_pipeline(const vk_pipeline (&pipelines)[3], con
     return pipelines[ggml_vk_float_type_idx(dst->type)];
 }
 
+static vk_pipeline ggml_vk_soft_max_big_pipeline(const vk_device & device, int64_t ncols, bool mask_f16) {
+    if (ncols <= 16384) {
+        return nullptr;
+    }
+    static const uint32_t caps[3] = { 64, 80, 128 };
+    for (int i = 0; i < 3; ++i) {
+        const vk_pipeline & p = mask_f16 ? device->pipeline_soft_max_big_f32_f16[i] : device->pipeline_soft_max_big_f32[i];
+        if (p && ncols <= (int64_t) (512 * caps[i])) {
+            return p;
+        }
+    }
+    return nullptr;
+}
+
 static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, const ggml_tensor * dst, ggml_op op) {
     switch (op) {
     case GGML_OP_GET_ROWS:
@@ -10046,9 +10073,11 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
         }
 
         if (src0->type == GGML_TYPE_F32 && (src1 == nullptr || src1->type == GGML_TYPE_F32) && dst->type == GGML_TYPE_F32) {
+            if (vk_pipeline big = ggml_vk_soft_max_big_pipeline(ctx->device, src0->ne[0], false)) return big;
             return src0->ne[0] > 1024 ? ctx->device->pipeline_soft_max_f32_wg512 : ctx->device->pipeline_soft_max_f32;
         }
         if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F32) {
+            if (vk_pipeline big = ggml_vk_soft_max_big_pipeline(ctx->device, src0->ne[0], true)) return big;
             return src0->ne[0] > 1024 ? ctx->device->pipeline_soft_max_f32_f16_wg512 : ctx->device->pipeline_soft_max_f32_f16;
         }
         return nullptr;
@@ -12241,7 +12270,8 @@ void ggml_vk_soft_max(ggml_backend_vk_context * ctx, vk_context& subctx, const g
         src2 != nullptr
     };
 
-    if (ncols <= 16384) {
+    // rows longer than 16384 use a register-cached single-pass variant when one fits, else the 3-pass large path
+    if (ncols <= 16384 || ggml_vk_soft_max_big_pipeline(ctx->device, ncols, src1 && src1->type == GGML_TYPE_F16)) {
         ggml_vk_op_f32<vk_op_soft_max_push_constants>(ctx, subctx, src0, src1, src2, nullptr, dst, GGML_OP_SOFT_MAX, std::move(pc));
     } else {
 
