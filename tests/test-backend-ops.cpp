@@ -10675,7 +10675,7 @@ static const ggml_type other_types[] = {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     if (getenv("GLM_FA_PERF")) {
-        for (int kv : {8191, 8192, 8448, 24576, 24832, 32768, 65280, 65536}) {
+        for (int kv : {16, 256, 4112, 8191, 8192, 8448, 24576, 24832, 32768, 65280, 65536}) {
             test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {20, 1}, kv, 1, true, false, 0, 0,
                 GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true));
         }
@@ -13708,6 +13708,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         // KQ softmax shapes of GLM-4.7-Flash non-FA prefill: [n_kv, 512 tokens, 20 heads], f16 mask broadcast over heads
         for (int kv : {8448, 16384, 16896, 25088, 33280, 40960, 65280}) {
             test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {kv, 512, 1, 1}, true, false, GGML_TYPE_F16, {20, 1}, 0.1f, 0.0f, false));
+        }
+        return test_cases;
+    }
+    if (getenv("GLM_BW_PERF")) {
+        // 32768 x 576 f16 = 37.7 MB, the K cache of one layer at 32K
+        test_cases.emplace_back(new test_cpy(GGML_TYPE_F16, GGML_TYPE_F16, {576, 32768, 1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 32768, 1, 576, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 16384, 1, 4096, {1, 1}, {1, 1}));
+        return test_cases;
+    }
+    if (getenv("GLM_FA_DECODE_PERF")) {
+        for (int kv : {256, 1024, 2048, 4096, 8192, 16384, 32768, 65536}) {
+            test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {20, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true, 0));
         }
         return test_cases;
     }

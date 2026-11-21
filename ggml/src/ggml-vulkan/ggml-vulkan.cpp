@@ -3582,6 +3582,11 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             ggml_vk_create_pipeline(device, pipelines.second, "xe_fa_decode_ph2", fa_decode_ph2_cm1_len, fa_decode_ph2_cm1_data, "main", 5, sizeof(vk_xe_fa_push_constants), { 1, 1, 1 }, sc_ph2, 1, false, true, xe_fa_params.subgroup_size[0]);
         }
 
+        if (device->architecture == INTEL_XE2) {
+            // WG_SIZE, HSK, HSV, rows per workgroup
+            ggml_vk_create_pipeline(device, device->pipeline_xe_mla_decode, "xe_mla_decode", fa_mla_decode_cm1_len, fa_mla_decode_cm1_data, "main", 5, sizeof(vk_xe_mla_decode_push_constants), { 1, 1, 1 }, { 256, 576, 512, 128 }, 1, true, true, 16);
+        }
+
         for (auto& it : device->pipeline_xe_fa_prefill) {
             auto pipeline_state = it.first;
             auto& pipelines = it.second;
@@ -9083,11 +9088,27 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     size_t size_group_max = 0;
     size_t size_decode_temp = 0;
     uint32_t pv_ratio = uint32_t(neq2 / nev2);
+    // Single-token MLA decode: all heads share one f16 K/V head, so read each cache row once for QK and PV.
+    static const bool xe_mla_env_disable = getenv("GGML_VK_DISABLE_XE_MLA_DECODE") != nullptr;
+    // Rows per shader chunk. Each workgroup takes several chunks, so the split-K reducer gets about xe_mla_splits partial results.
+    constexpr uint32_t xe_mla_rows = 128;
+    static const uint32_t xe_mla_splits = getenv("GGML_VK_MLA_SPLITS") ? (uint32_t)atoi(getenv("GGML_VK_MLA_SPLITS")) : 48;
+    const uint32_t xe_mla_rows_per_wg = xe_mla_rows * std::max(1u, CEIL_DIV(CEIL_DIV(KV, xe_mla_splits), xe_mla_rows));
+    constexpr uint32_t xe_mla_heads = 24;
+    const bool xe_mla_decode = xe_fa_opt && !xe_mla_env_disable && vk_dev->architecture == INTEL_XE2 &&
+        neq1 == 1 && neq3 == 1 && nek2 == 1 && nev2 == 1 && neq2 > 16 && neq2 <= xe_mla_heads &&
+        HSK == 576 && HSV == 512 && !sinks && nem2 == 1 && nem3 == 1 && KV % 16 == 0 &&
+        nbk1 % 8 == 0 && nbv1 % 8 == 0;
+
     vk_xe_fa_tuning_params xe_fa_params {};
 
     {
         std::lock_guard<std::mutex> guard(ctx->device->compile_mutex);
-        if (xe_fa_opt) {
+        if (xe_mla_decode) {
+            // f16 copy of Q, padded to xe_mla_heads rows
+            size_q_staging = HSK * xe_mla_heads * sizeof(ggml_fp16_t);
+            size_decode_temp = size_q_staging;
+        } else if (xe_fa_opt) {
             if (neq1 > 8 || pv_ratio > 64) {
                 uint32_t head_stride_q = uint32_t(nbq2 / ggml_type_size(q->type));
                 uint32_t batch_stride_q = uint32_t(nbq3 / ggml_type_size(q->type));
@@ -9217,8 +9238,8 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     if (xe_fa_opt) {
         // Bypass mask_opt and split_k buffer grow when they are not in use
         use_mask_opt = false;
-        split_k = 1;
-        if (xe_fa_use_2phases) {
+        split_k = xe_mla_decode ? CEIL_DIV(KV, xe_mla_rows_per_wg) : 1;
+        if (xe_fa_use_2phases || xe_mla_decode) {
             if (ctx->prealloc_size_x < size_decode_temp) {
                 ctx->prealloc_size_x = size_decode_temp;
                 ggml_vk_preallocate_buffers(ctx, subctx);
@@ -9234,7 +9255,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     // and the per-row m and L values (ne1 rows). We store all the matrices first, followed by the rows.
     // For matrices, the order is (inner to outer) [HSV, ne1, k, ne2, ne3].
     // For L/M, the order is (inner to outer) [ne1, k, ne2, ne3].
-    const uint64_t split_k_size = split_k > 1 ? (HSV * ne1 * sizeof(float) + ne1 * sizeof(float) * 2) * split_k * ne2 * ne3 : 0;
+    const uint64_t split_k_size = (split_k > 1 || xe_mla_decode) ? (HSV * ne1 * sizeof(float) + ne1 * sizeof(float) * 2) * split_k * ne2 * ne3 : 0;
     if (split_k_size > ctx->device->properties.limits.maxStorageBufferRange) {
         GGML_ABORT("Requested preallocation size is too large");
     }
@@ -9432,7 +9453,27 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
                                              batch_stride_q, batch_stride_k, batch_stride_v, batch_stride_o,
                                              (sinks != nullptr) ? (1u << 16) : 0u, scale };
 
-        if (xe_fa_use_2phases) {
+        if (xe_mla_decode) {
+            auto to_fp16_vk_0 = ggml_vk_get_cpy_pipeline(ctx, q, nullptr, GGML_TYPE_F16);
+            vk_subbuffer q_temp_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_x, 0);
+            vk_subbuffer split_k_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_split_k, 0);
+            vk_pipeline mla = ctx->device->pipeline_xe_mla_decode;
+            vk_pipeline reduce = ctx->device->pipeline_flash_attn_split_k_reduce;
+            ggml_pipeline_request_descriptor_sets(ctx, to_fp16_vk_0, 1);
+            ggml_pipeline_request_descriptor_sets(ctx, mla, 1);
+            ggml_pipeline_request_descriptor_sets(ctx, reduce, 1);
+
+            ggml_vk_cpy_to_contiguous(ctx, subctx, to_fp16_vk_0, q, q_buf, q_temp_buf);
+
+            const vk_xe_mla_decode_push_constants pc_mla = { KV, (uint32_t)neq2, k_stride, v_stride, split_k, xe_mla_rows_per_wg, scale };
+            ggml_vk_dispatch_pipeline(ctx, subctx, mla, { q_temp_buf, k_buf, v_buf, mask_buf, split_k_buf }, pc_mla, { split_k, 1, 1 });
+
+            ggml_vk_sync_buffers(ctx, subctx);
+            const vk_op_flash_attn_split_k_reduce_push_constants pc2 = { HSV, (uint32_t)ne1, 1, 1, split_k, 0 };
+            ggml_vk_dispatch_pipeline(ctx, subctx, reduce, { split_k_buf, sinks_buf, dst_buf }, pc2, { (uint32_t)ne1, HSV, 1 });
+            ctx->prealloc_split_k_need_sync = true;
+            ctx->prealloc_x_need_sync = true;
+        } else if (xe_fa_use_2phases) {
             auto to_fp16_vk_0 = ggml_vk_get_cpy_pipeline(ctx, q, nullptr, GGML_TYPE_F16);
             size_t temp_buf_offset = 0;
             vk_subbuffer q_temp_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_x, temp_buf_offset);

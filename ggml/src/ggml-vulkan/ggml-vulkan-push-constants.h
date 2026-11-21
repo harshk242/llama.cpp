@@ -952,6 +952,16 @@ struct vk_quantize_q8_1_push_constants {
     uint32_t num_blocks;
 };
 
+struct vk_xe_mla_decode_push_constants {
+    uint32_t KV;
+    uint32_t NH;
+    uint32_t k_stride;
+    uint32_t v_stride;
+    uint32_t n_split;
+    uint32_t rows_per_wg;
+    float scale;
+};
+
 struct vk_op_flash_attn_split_k_reduce_push_constants {
     uint32_t D;
     uint32_t ne1;

@@ -1015,6 +1015,7 @@ struct vk_device_struct {
 
     vk_pipeline pipeline_flash_attn_split_k_reduce;
     std::map<vk_xe_fa_pipeline_state, std::pair<vk_pipeline, vk_pipeline>> pipeline_xe_fa_decode_dual_phases;
+    vk_pipeline pipeline_xe_mla_decode;
     std::map<vk_xe_fa_pipeline_state, vk_pipeline> pipeline_xe_fa_prefill;
     vk_pipeline pipeline_count_experts;
 
