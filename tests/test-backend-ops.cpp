@@ -10674,6 +10674,13 @@ static const ggml_type other_types[] = {
 // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+    if (getenv("GLM_SM_PERF")) {
+        for (int kv : {16385, 16896, 25088, 32768, 33280, 40960, 40961, 65280}) {
+            test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {kv, 64, 1, 1}, true, false, GGML_TYPE_F16, {20, 1}, 0.1f, 0.0f, false));
+            test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {kv, 8, 1, 1}, true, false, GGML_TYPE_F32, {3, 1}, 1.0f, 0.0f, false));
+        }
+        return test_cases;
+    }
     std::default_random_engine rng(0);
 
     // unary ops
@@ -13688,6 +13695,25 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // GLM-4.7-Flash (deepseek2 MLA): 20 q heads, 1 latent kv head, K=576, V=512 (view of K)
+    if (getenv("GLM_SM_PERF")) {
+        // KQ softmax shapes of GLM-4.7-Flash non-FA prefill: [n_kv, 512 tokens, 20 heads], f16 mask broadcast over heads
+        for (int kv : {8448, 16896, 25088, 33280, 40960, 65280}) {
+            test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {kv, 512, 1, 1}, true, false, GGML_TYPE_F16, {20, 1}, 0.1f, 0.0f, false));
+        }
+        return test_cases;
+    }
+    if (getenv("GLM_FA_PERF")) {
+        for (ggml_type t : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+            for (int kv : {8192, 16384, 32768}) {
+                for (int nb : {1, 512, 1024, 2048}) {
+                    test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {20, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, t, t, {0, 1, 2, 3}, true, true, 0));
+                }
+            }
+        }
+        return test_cases;
+    }
 
     test_cases.emplace_back(new test_timestep_embedding());
     test_cases.emplace_back(new test_timestep_embedding(GGML_TYPE_F32, {32769, 1, 1, 1}, 4096, 10000));

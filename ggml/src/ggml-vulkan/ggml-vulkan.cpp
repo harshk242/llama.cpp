@@ -1,4 +1,5 @@
 #include "ggml-vulkan-common.h"
+#include <set>
 
 static vk_device_architecture get_device_architecture(const vk::PhysicalDevice& device) {
     vk::PhysicalDeviceProperties props = device.getProperties();
@@ -9068,7 +9069,8 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     auto vk_dev = ctx->device.get();
     bool xe_fa_opt = false;
     bool xe_fa_use_2phases = false;
-    bool xe_fa_supported_platform = vk_dev->xe_fa_support && vk_dev->properties.deviceID != 0xFD80 && vk_dev->properties.deviceID != 0xFD81;
+    static const bool xe_fa_env_disable = getenv("GGML_VK_DISABLE_XE_FA") != nullptr;
+    bool xe_fa_supported_platform = !xe_fa_env_disable && vk_dev->xe_fa_support && vk_dev->properties.deviceID != 0xFD80 && vk_dev->properties.deviceID != 0xFD81;
     bool xe_fa_supported_usage = neq0 % 32 == 0 && nev0 % 16 == 0 && mask != nullptr && !use_sparse && max_bias == 0.0f && logit_softcap == 0.0f &&
                                  tensor_aligned_with(k, 16u) && tensor_aligned_with(v, 16u);
     bool xe_fa_supported_dtype = q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16 &&
@@ -9148,6 +9150,18 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         }
     }
 
+    if (getenv("GGML_VK_FA_DEBUG")) {
+        static std::set<std::string> seen;
+        char buf[256];
+        snprintf(buf, sizeof(buf), "FA_PATH N=%d KV=%d HSK=%d HSV=%d gqa=%d k=%s -> %s (xe_shmem=%zu max=%u) Br=%u Bc=%u",
+            (int)N, (int)KV, (int)HSK, (int)HSV, (int)gqa_ratio, ggml_type_name(k->type),
+            xe_fa_opt ? (xe_fa_use_2phases ? "XE_DECODE_2PH" : "XE_PREFILL") :
+            tuning_params.path == FA_SCALAR ? "SCALAR" : tuning_params.path == FA_COOPMAT1 ? "COOPMAT1" : "COOPMAT2",
+            (size_t)xe_fa_params.shmem_sz, ctx->device->properties.limits.maxComputeSharedMemorySize,
+            tuning_params.block_rows, tuning_params.block_cols);
+        std::string key = std::string(buf).substr(0, std::string(buf).find(" KV=")) + std::string(buf).substr(std::string(buf).find(" ->"));
+        if (seen.insert(key).second) fprintf(stderr, "%s\n", buf);
+    }
     if (!xe_fa_opt) {
         assert(pipeline);
         // Compile early to initialize wg_denoms.
