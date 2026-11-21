@@ -10826,7 +10826,7 @@ static const ggml_type other_types[] = {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     if (getenv("GLM_SM_PERF")) {
-        for (int kv : {16385, 16896, 25088, 32768, 33280, 40960, 40961, 65280}) {
+        for (int kv : {8193, 8448, 16384, 16385, 16896, 25088, 32768, 33280, 40960, 40961, 65280}) {
             test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {kv, 64, 1, 1}, true, false, GGML_TYPE_F16, {20, 1}, 0.1f, 0.0f, false));
             test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {kv, 8, 1, 1}, true, false, GGML_TYPE_F32, {3, 1}, 1.0f, 0.0f, false));
         }
@@ -13922,7 +13922,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // GLM-4.7-Flash (deepseek2 MLA): 20 q heads, 1 latent kv head, K=576, V=512 (view of K)
     if (getenv("GLM_SM_PERF")) {
         // KQ softmax shapes of GLM-4.7-Flash non-FA prefill: [n_kv, 512 tokens, 20 heads], f16 mask broadcast over heads
-        for (int kv : {8448, 16896, 25088, 33280, 40960, 65280}) {
+        for (int kv : {8448, 16384, 16896, 25088, 33280, 40960, 65280}) {
             test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {kv, 512, 1, 1}, true, false, GGML_TYPE_F16, {20, 1}, 0.1f, 0.0f, false));
         }
         return test_cases;
