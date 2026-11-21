@@ -10867,6 +10867,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
         return test_cases;
     }
+    if (getenv("GLM_MM_PERF")) {
+        // shapes that take the grouped tile order of mul_mm (many row tiles and column tiles), with partial groups
+        for (int m : {8192, 8448, 12416, 16896}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, m, 512, 576, {1, 1}, {20, 1}));
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, m, 1000, 64, {1, 1}, {3, 1}));
+        }
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 12416, 1024, 256, {1, 1}, {1, 1}));
+        return test_cases;
+    }
     if (getenv("GLM_SM_PERF")) {
         for (int kv : {7, 512, 1025, 8448, 16384, 16896, 33280, 65536}) {
             test_cases.emplace_back(new test_soft_max_f16({kv, 33, 1, 1}, 5, 0.1f));
@@ -13970,6 +13979,25 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         for (int kv : {8448, 16384, 16896, 25088, 33280, 40960, 65280}) {
             test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {kv, 512, 1, 1}, true, false, GGML_TYPE_F16, {20, 1}, 0.1f, 0.0f, false));
             test_cases.emplace_back(new test_soft_max_f16({kv, 512, 1, 1}, 20, 0.1f));
+        }
+        return test_cases;
+    }
+    if (getenv("GLM_MM_PERF")) {
+        for (int kv : {16896, 33280}) {
+            // prefill KQ (k broadcast over 20 heads) and KQV
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, kv, 512, 576, {1, 1}, {20, 1}));
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, kv, 10240, 576, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 512, 512, kv, {1, 1}, {20, 1}));
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16, 512, 512, kv, {1, 1}, {20, 1}));
+        }
+        // K small enough to stay in cache, and the same work with the roles of the operands swapped
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 4096, 512, 576, {1, 1}, {20, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 512, 16896, 576, {1, 1}, {20, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16, 16896, 512, 576, {1, 1}, {20, 1}));
+        for (int kv : {16384, 32768}) {
+            // decode with the 20 heads as columns
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, kv, 20, 576, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 512, 20, kv, {1, 1}, {1, 1}));
         }
         return test_cases;
     }
