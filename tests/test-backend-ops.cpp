@@ -10826,7 +10826,7 @@ static const ggml_type other_types[] = {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     if (getenv("GLM_FA_PERF")) {
-        for (int kv : {8192, 24575, 24576, 24832, 32768, 65280}) {
+        for (int kv : {8191, 8192, 8448, 24576, 24832, 32768, 65280, 65536}) {
             test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {20, 1}, kv, 1, true, false, 0, 0,
                 GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true));
         }

@@ -1623,6 +1623,12 @@ static vk_xe_fa_tuning_params get_xe_fa_tuning_params(const vk_device_struct * d
         uint32_t aligned_pv_ratio = upper_power_of_2(pv_ratio);
         uint32_t split_p_per_iter_ph2 = (pv_ratio <= 32) ? 256 : 128;
         uint32_t out_col_per_wg_ph2 = intel_gpu ? (pv_ratio > 16 ? 8 : 16) : 16;
+        if (pipeline_state.kv_chunk) {
+            // A wider output tile shares each staged probability across more V
+            // columns. Halve the sequence tile to keep shared memory bounded.
+            split_p_per_iter_ph2 = 128;
+            out_col_per_wg_ph2 = 16;
+        }
         uint32_t split_p_per_warp = 16;
         uint32_t group_sz_ph2 = (split_p_per_iter_ph2 / split_p_per_warp) * sg_sz;
         sg_per_gw = group_sz_ph2 / sg_sz;
@@ -9249,7 +9255,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     constexpr uint32_t xe_decode_chunk = 4096;
     const bool xe_split_decode = vk_dev->vendor_id == VK_VENDOR_ID_INTEL && vk_dev->properties.deviceID == 0xB082 &&
         neq1 == 1 && neq2 == 20 && neq3 == 1 && nek2 == 1 && nev2 == 1 &&
-        HSK == 576 && HSV == 512 && !sinks && KV >= 24576 && KV <= 65536 && KV % 256 == 0;
+        HSK == 576 && HSV == 512 && !sinks && KV >= 8192 && KV <= 65536 && KV % 256 == 0;
 
     vk_xe_fa_tuning_params xe_fa_params {};
 
