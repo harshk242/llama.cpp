@@ -3958,16 +3958,21 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_soft_max_f32_wg512, "soft_max_f32_wg512", soft_max_f32_len, soft_max_f32_data, "main", 4, sizeof(vk_op_soft_max_push_constants), {1, 1, 1}, { 512 }, 1);
     ggml_vk_create_pipeline(device, device->pipeline_soft_max_f32_f16, "soft_max_f32_f16", soft_max_f32_f16_len, soft_max_f32_f16_data, "main", 4, sizeof(vk_op_soft_max_push_constants), {1, 1, 1}, { device->subgroup_size }, 1);
     ggml_vk_create_pipeline(device, device->pipeline_soft_max_f32_f16_wg512, "soft_max_f32_f16_wg512", soft_max_f32_f16_len, soft_max_f32_f16_data, "main", 4, sizeof(vk_op_soft_max_push_constants), {1, 1, 1}, { 512 }, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_soft_max_f32_f16_f16, "soft_max_f32_f16_f16", soft_max_f32_f16_f16_len, soft_max_f32_f16_f16_data, "main", 4, sizeof(vk_op_soft_max_push_constants), {1, 1, 1}, { device->subgroup_size }, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_soft_max_f32_f16_f16_wg512, "soft_max_f32_f16_f16_wg512", soft_max_f32_f16_f16_len, soft_max_f32_f16_f16_data, "main", 4, sizeof(vk_op_soft_max_push_constants), {1, 1, 1}, { 512 }, 1);
     {
         static const char * sm_big_disable = getenv("GGML_VK_SOFTMAX_BIG_DISABLE");
         if (!sm_big_disable) {
             ggml_vk_create_pipeline(device, device->pipeline_soft_max_big_f32[0], "soft_max_big64_f32", soft_max_big64_f32_len, soft_max_big64_f32_data, "main", 4, sizeof(vk_op_soft_max_push_constants), {1, 1, 1}, { 512 }, 1);
             ggml_vk_create_pipeline(device, device->pipeline_soft_max_big_f32_f16[0], "soft_max_big64_f32_f16", soft_max_big64_f32_f16_len, soft_max_big64_f32_f16_data, "main", 4, sizeof(vk_op_soft_max_push_constants), {1, 1, 1}, { 512 }, 1);
+            ggml_vk_create_pipeline(device, device->pipeline_soft_max_big_f32_f16_f16[0], "soft_max_big64_f32_f16_f16", soft_max_big64_f32_f16_f16_len, soft_max_big64_f32_f16_f16_data, "main", 4, sizeof(vk_op_soft_max_push_constants), {1, 1, 1}, { 512 }, 1);
             ggml_vk_create_pipeline(device, device->pipeline_soft_max_big_f32[1], "soft_max_big80_f32", soft_max_big80_f32_len, soft_max_big80_f32_data, "main", 4, sizeof(vk_op_soft_max_push_constants), {1, 1, 1}, { 512 }, 1);
             ggml_vk_create_pipeline(device, device->pipeline_soft_max_big_f32_f16[1], "soft_max_big80_f32_f16", soft_max_big80_f32_f16_len, soft_max_big80_f32_f16_data, "main", 4, sizeof(vk_op_soft_max_push_constants), {1, 1, 1}, { 512 }, 1);
+            ggml_vk_create_pipeline(device, device->pipeline_soft_max_big_f32_f16_f16[1], "soft_max_big80_f32_f16_f16", soft_max_big80_f32_f16_f16_len, soft_max_big80_f32_f16_f16_data, "main", 4, sizeof(vk_op_soft_max_push_constants), {1, 1, 1}, { 512 }, 1);
             if (!getenv("GGML_VK_SOFTMAX_BIG128_DISABLE")) {
                 ggml_vk_create_pipeline(device, device->pipeline_soft_max_big_f32[2], "soft_max_big128_f32", soft_max_big128_f32_len, soft_max_big128_f32_data, "main", 4, sizeof(vk_op_soft_max_push_constants), {1, 1, 1}, { 512 }, 1);
                 ggml_vk_create_pipeline(device, device->pipeline_soft_max_big_f32_f16[2], "soft_max_big128_f32_f16", soft_max_big128_f32_f16_len, soft_max_big128_f32_f16_data, "main", 4, sizeof(vk_op_soft_max_push_constants), {1, 1, 1}, { 512 }, 1);
+                ggml_vk_create_pipeline(device, device->pipeline_soft_max_big_f32_f16_f16[2], "soft_max_big128_f32_f16_f16", soft_max_big128_f32_f16_f16_len, soft_max_big128_f32_f16_f16_data, "main", 4, sizeof(vk_op_soft_max_push_constants), {1, 1, 1}, { 512 }, 1);
             }
         }
     }
@@ -9860,13 +9865,14 @@ static vk_pipeline ggml_vk_float_pipeline(const vk_pipeline (&pipelines)[3], con
     return pipelines[ggml_vk_float_type_idx(dst->type)];
 }
 
-static vk_pipeline ggml_vk_soft_max_big_pipeline(const vk_device & device, int64_t ncols, bool mask_f16) {
+static vk_pipeline ggml_vk_soft_max_big_pipeline(const vk_device & device, int64_t ncols, bool mask_f16, bool out_f16 = false) {
     if (ncols <= 16384) {
         return nullptr;
     }
     static const uint32_t caps[3] = { 64, 80, 128 };
     for (int i = 0; i < 3; ++i) {
-        const vk_pipeline & p = mask_f16 ? device->pipeline_soft_max_big_f32_f16[i] : device->pipeline_soft_max_big_f32[i];
+        const vk_pipeline & p = out_f16 ? device->pipeline_soft_max_big_f32_f16_f16[i] :
+                                mask_f16 ? device->pipeline_soft_max_big_f32_f16[i] : device->pipeline_soft_max_big_f32[i];
         if (p && ncols <= (int64_t) (512 * caps[i])) {
             return p;
         }
@@ -10120,6 +10126,11 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
     case GGML_OP_SOFT_MAX:
         GGML_ASSERT(!src1 || src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16);
         GGML_ASSERT(!src2 || src2->type == GGML_TYPE_F32);
+
+        if (ctx->fused_soft_max_f16) {
+            if (vk_pipeline big = ggml_vk_soft_max_big_pipeline(ctx->device, src0->ne[0], true, true)) return big;
+            return src0->ne[0] > 1024 ? ctx->device->pipeline_soft_max_f32_f16_f16_wg512 : ctx->device->pipeline_soft_max_f32_f16_f16;
+        }
 
         if (ctx->num_additional_fused_ops) {
             uint32_t idx = (uint32_t)ceilf(log2f(float(dst->ne[0])));
@@ -12293,7 +12304,9 @@ void ggml_vk_glu(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_t
 }
 
 void ggml_vk_soft_max(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, ggml_tensor * dst) {
-    float * op_params = (float *)dst->op_params;
+    // dst is the f16 cast when the cast is fused into the soft_max
+    const ggml_tensor * sm = dst->op == GGML_OP_SOFT_MAX ? dst : dst->src[0];
+    float * op_params = (float *)sm->op_params;
 
     float scale = op_params[0];
     float max_bias = op_params[1];
@@ -13825,7 +13838,7 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
         if (ctx->fused_topk_moe_mode != TOPK_MOE_COUNT) {
             ggml_vk_topk_moe(ctx, compute_ctx, cgraph, node_idx);
         } else {
-            ggml_vk_soft_max(ctx, compute_ctx, src0, src1, src2, node);
+            ggml_vk_soft_max(ctx, compute_ctx, src0, src1, src2, cgraph->nodes[node_idx + ctx->num_additional_fused_ops]);
         }
 
         break;
@@ -14831,6 +14844,37 @@ static bool ggml_vk_can_fuse_hc_post_gate(const struct ggml_cgraph * cgraph, int
            ggml_are_same_shape(scale_in->src[0], scale_out);
 }
 
+// soft_max with an f16 mask, followed by a cast of its result to f16.
+// The soft_max may be in-place on its input: then the graph allocator cannot put the f16 result over that input.
+static bool ggml_vk_can_fuse_soft_max_f16(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    if (node_idx + 1 >= cgraph->n_nodes) {
+        return false;
+    }
+    const ggml_tensor * sm = cgraph->nodes[node_idx];
+    const ggml_tensor * cpy = cgraph->nodes[node_idx + 1];
+    if (sm->op != GGML_OP_SOFT_MAX || cpy->op != GGML_OP_CPY || cpy->src[0] != sm ||
+        (sm->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || (cpy->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
+        (sm->flags & GGML_TENSOR_FLAG_OUTPUT) || ggml_node_get_use_count(cgraph, node_idx) != 1) {
+        return false;
+    }
+    const ggml_tensor * a = sm->src[0];
+    if (sm->view_src) {
+        // only the in-place form, and the input must have no other user
+        if (sm->view_src != a || sm->data != a->data || (a->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            return false;
+        }
+        const size_t pos = ggml_hash_find(&cgraph->visited_hash_set, a);
+        if (!ggml_bitset_get(cgraph->visited_hash_set.used, pos) || cgraph->use_counts[pos] != 1) {
+            return false;
+        }
+    }
+    const float max_bias = ggml_get_op_params_f32(sm, 1);
+    return a->type == GGML_TYPE_F32 && sm->src[1] && sm->src[1]->type == GGML_TYPE_F16 && !sm->src[2] &&
+           max_bias == 0.0f && cpy->type == GGML_TYPE_F16 &&
+           ggml_is_contiguous(a) && ggml_is_contiguous(cpy) && ggml_are_same_shape(sm, cpy) &&
+           (sm->ne[0] <= 16384 || ggml_vk_soft_max_big_pipeline(ctx->device, sm->ne[0], true, true));
+}
+
 bool ggml_vk_can_fuse(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx, std::initializer_list<enum ggml_op> ops) {
     if (ops.size() == 2 && ops.begin()[0] == GGML_OP_UNARY && ops.begin()[1] == GGML_OP_MUL) {
         return ggml_vk_can_fuse_unary_mul_pair(cgraph, node_idx);
@@ -15698,6 +15742,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_topk_qsa = false;
         ctx->fused_hc_post_gate = false;
         ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
+        ctx->fused_soft_max_f16 = false;
         const char *fusion_string {};
         if (!ctx->device->disable_fusion) {
             uint32_t num_adds = ggml_vk_fuse_multi_add(ctx, cgraph, i);
@@ -15874,6 +15919,13 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_topk_moe_mode = TOPK_MOE_LATE_SOFTMAX;
                 fusion_string = "TOPK_MOE_LATE_SOFTMAX";
                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
+            } else if (ggml_vk_can_fuse_soft_max_f16(ctx, cgraph, i)) {
+                ctx->num_additional_fused_ops = 1;
+                ctx->fused_soft_max_f16 = true;
+                fusion_string = "SOFT_MAX_F16";
+                // soft_max reads whole rows. The cast is elementwise, and ggml_cast lists its own output as src[1].
+                op_srcs_fused_elementwise[0] = false;
+                op_srcs_fused_elementwise[1] = true;
             }
             if (ctx->fused_topk_moe_mode != TOPK_MOE_COUNT) {
                 // Look for an additional scale op to fuse - occurs in deepseek2 and nemotron3 nano.
@@ -15940,6 +15992,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_topk_qsa = false;
                 ctx->fused_hc_post_gate = false;
                 ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
+                ctx->fused_soft_max_f16 = false;
                 fusion_string = nullptr;
             }
         }

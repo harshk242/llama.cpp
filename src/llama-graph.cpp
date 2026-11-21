@@ -3221,9 +3221,25 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             cb(kq, "kq_plus_kq_b", il);
         }
 
-        kq = ggml_soft_max_ext(ctx0, kq, kq_mask, kq_scale, hparams.f_max_alibi_bias);
+        // hybrid prefill: f16 probabilities halve the reads of the KQV product. The Vulkan backend fuses the
+        // cast into soft_max for rows of up to 65536 columns. The in-place soft_max keeps the f16 result out of
+        // the memory of the f32 scores.
+        static const bool kq_f32 = getenv("LLAMA_HYBRID_KQ_F32") != nullptr;
+        const bool kq_f16 = fa_hybrid_skip && !kq_f32 && v->type == GGML_TYPE_F16 && !sinks && hparams.f_max_alibi_bias == 0.0f &&
+                            kq->ne[0] <= 65536;
+
+        if (kq_f16) {
+            kq = ggml_soft_max_ext_inplace(ctx0, kq, kq_mask, kq_scale, hparams.f_max_alibi_bias);
+        } else {
+            kq = ggml_soft_max_ext(ctx0, kq, kq_mask, kq_scale, hparams.f_max_alibi_bias);
+        }
         ggml_soft_max_add_sinks(kq, sinks);
         cb(kq, "kq_soft_max", il);
+
+        if (kq_f16) {
+            kq = ggml_cast(ctx0, kq, GGML_TYPE_F16);
+            cb(kq, "kq_soft_max_f16", il);
+        }
 
         if (!v_trans) {
             // note: avoid this branch
