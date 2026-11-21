@@ -3131,7 +3131,14 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
     ggml_tensor * cur;
 
-    const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr;
+    // Hybrid attention: with LLAMA_FA_MAX_TOKENS=N, keep the flash-attention KV layout but only use the
+    // FA kernel for ubatches of <= N tokens (decode); larger ubatches (prefill) use mul_mat + soft_max.
+    static const int64_t fa_max_tokens = [] {
+        const char * e = getenv("LLAMA_FA_MAX_TOKENS");
+        return e ? (int64_t) atoll(e) : (int64_t) -1;
+    }();
+    const bool fa_hybrid_skip = fa_max_tokens >= 0 && kv_rows == nullptr && q->ne[1] > fa_max_tokens;
+    const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr && !fa_hybrid_skip;
     GGML_ASSERT(use_flash_attn || kv_rows == nullptr);
     if (use_flash_attn) {
         GGML_ASSERT(kq_b == nullptr && "Flash attention does not support KQ bias yet");
