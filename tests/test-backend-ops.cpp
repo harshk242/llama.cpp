@@ -10825,6 +10825,13 @@ static const ggml_type other_types[] = {
 // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+    if (getenv("GLM_FA_PERF")) {
+        for (int kv : {8192, 24575, 24576, 24832, 32768, 65280}) {
+            test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {20, 1}, kv, 1, true, false, 0, 0,
+                GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true));
+        }
+        return test_cases;
+    }
     if (getenv("GLM_SM_PERF")) {
         for (int kv : {8193, 8448, 16384, 16385, 16896, 25088, 32768, 33280, 40960, 40961, 65280}) {
             test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {kv, 64, 1, 1}, true, false, GGML_TYPE_F16, {20, 1}, 0.1f, 0.0f, false));
