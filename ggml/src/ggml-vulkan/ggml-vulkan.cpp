@@ -7487,7 +7487,9 @@ static bool ggml_vk_should_use_mmvq(const vk_device& device, uint32_t m, uint32_
 
     // q6_k only has 2-byte alignment which makes it somewhat problematic,
     // using MMVQ is only a win on Intel.
-    bool mmvq_q6 = device->vendor_id == VK_VENDOR_ID_INTEL;
+    // GGML_VK_Q6K_NO_MMVQ: on Intel Xe3 (Panther Lake, Mesa) the q6_k MMVQ mat-vec is slower than the dequant path.
+    static const bool q6k_no_mmvq = getenv("GGML_VK_Q6K_NO_MMVQ") != nullptr;
+    bool mmvq_q6 = device->vendor_id == VK_VENDOR_ID_INTEL && !q6k_no_mmvq;
     if (src0_type == GGML_TYPE_Q6_K && !mmvq_q6) {
         return false;
     }
@@ -7528,7 +7530,7 @@ static bool ggml_vk_should_use_mmvq(const vk_device& device, uint32_t m, uint32_
         }
     case VK_VENDOR_ID_INTEL:
         if (device->architecture == vk_device_architecture::INTEL_XE2) {
-            if (src0_type == GGML_TYPE_Q2_0 || src0_type == GGML_TYPE_Q2_K || src0_type == GGML_TYPE_Q3_K || src0_type == GGML_TYPE_Q6_K) {
+            if (src0_type == GGML_TYPE_Q2_0 || src0_type == GGML_TYPE_Q2_K || src0_type == GGML_TYPE_Q3_K || (src0_type == GGML_TYPE_Q6_K && mmvq_q6)) {
                 return true;
             }
         }
