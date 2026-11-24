@@ -751,7 +751,41 @@ static int server_run_instance(common_params & params, server_role & role, commo
     }
 
     routes.update_meta(ctx_server);
-    ctx_http.is_ready.store(true);
+
+    // LLAMA_SLOT_RESTORE=<file in --slot-save-path>: restore slot 0 before the server reports ready,
+    // so no request can run first and then be overwritten by a restore posted over HTTP
+    std::thread restore_thread;
+    {
+        const char * restore_file = getenv("LLAMA_SLOT_RESTORE");
+        const std::string filename = restore_file ? restore_file : "";
+        if (filename.empty()) {
+            ctx_http.is_ready.store(true);
+        } else if (params.slot_save_path.empty() || !fs_validate_filename(filename)) {
+            SRV_WRN("LLAMA_SLOT_RESTORE=%s ignored: needs --slot-save-path and a plain file name\n", filename.c_str());
+            ctx_http.is_ready.store(true);
+        } else {
+            const std::string filepath = params.slot_save_path + filename;
+            // runs once start_loop() below processes the task
+            restore_thread = std::thread([&ctx_server, &ctx_http, &sse_stopping, filename, filepath]() {
+                if (std::filesystem::exists(filepath)) {
+                    auto rd = ctx_server.get_response_reader();
+                    server_task task(SERVER_TASK_TYPE_SLOT_RESTORE);
+                    task.id = rd.get_new_id();
+                    task.slot_action.id_slot  = 0;
+                    task.slot_action.filename = filename;
+                    task.slot_action.filepath = filepath;
+                    rd.post_task(std::move(task));
+                    auto result = rd.next([&sse_stopping]() { return sse_stopping.load(); });
+                    if (result && !result->is_error()) {
+                        SRV_INF("restored slot 0 from %s: %s\n", filepath.c_str(), result->to_json().dump().c_str());
+                    } else {
+                        SRV_WRN("could not restore slot 0 from %s: %s\n", filepath.c_str(), result ? result->to_json().dump().c_str() : "terminated");
+                    }
+                }
+                ctx_http.is_ready.store(true);
+            });
+        }
+    }
 
     SRV_INF("%s", "model loaded\n");
 
@@ -785,6 +819,9 @@ static int server_run_instance(common_params & params, server_role & role, commo
         ctx_http.stop();
         ctx_http.join();
         clean_up();
+        if (restore_thread.joinable()) {
+            restore_thread.join();
+        }
         return 1;
     }
 
@@ -803,6 +840,9 @@ static int server_run_instance(common_params & params, server_role & role, commo
     ctx_server.start_loop();
 
     clean_up();
+    if (restore_thread.joinable()) {
+        restore_thread.join();
+    }
     ctx_http.join();
     if (monitor_thread.joinable()) {
         monitor_thread.join();
