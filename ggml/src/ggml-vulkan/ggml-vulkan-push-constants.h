@@ -536,6 +536,7 @@ struct vk_op_topk_moe_push_constants {
     uint32_t with_norm;
     float output_scale;
     float output_bias;
+    float norm_bias; // added to the clamped sum of the weights
 };
 
 struct vk_op_add_id_push_constants {
