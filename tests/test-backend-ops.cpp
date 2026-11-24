@@ -14191,6 +14191,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 512, 1, 192, {20, 1}, {1, 1}));
         return test_cases;
     }
+    if (getenv("INKLING_MV_PERF")) {
+        // decode expert mat-vecs of Inkling 2 Mini UD-Q4_K_XL: 128 experts, 8 used, gate_up 2304 x 2304, down 2304 x 1152
+        for (ggml_type t : {GGML_TYPE_NVFP4, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0}) {
+            test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, 128, 8, false, 2304, 1, 2304));
+            test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, 128, 8, false, 2304, 1, 1152));
+            // dense, DRAM bound
+            test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 201088, 1, 2304, {1, 1}, {1, 1}));
+        }
+        return test_cases;
+    }
     if (getenv("GLM_BW_PERF")) {
         // 32768 x 576 f16 = 37.7 MB, the K cache of one layer at 32K
         test_cases.emplace_back(new test_cpy(GGML_TYPE_F16, GGML_TYPE_F16, {576, 32768, 1, 1}));

@@ -6335,8 +6335,8 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context * 
         // Prefer larger workgroups when M is small, to spread the work out more
         // and keep more SMs busy.
         // q6_k seems to prefer small workgroup size even for "medium" values of M.
-        if (a_type == GGML_TYPE_Q6_K || (a_type == GGML_TYPE_Q8_0 && ctx->device->vendor_id == VK_VENDOR_ID_INTEL)) {
-            // the q6_k and q8_0 shaders with contiguous 16-bit loads are faster with one subgroup per workgroup on Intel
+        if (a_type == GGML_TYPE_Q6_K || ((a_type == GGML_TYPE_Q8_0 || a_type == GGML_TYPE_NVFP4) && ctx->device->vendor_id == VK_VENDOR_ID_INTEL)) {
+            // the q6_k, q8_0 and nvfp4 shaders with contiguous loads are faster with one subgroup per workgroup on Intel
             if (ctx->device->vendor_id != VK_VENDOR_ID_INTEL && m < 4096 && k >= 1024) {
                 dmmv_wg = DMMV_WG_SIZE_LARGE;
             }
@@ -6424,8 +6424,8 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec_id(ggml_backend_vk_context
         // Prefer larger workgroups when M is small, to spread the work out more
         // and keep more SMs busy.
         // q6_k seems to prefer small workgroup size even for "medium" values of M.
-        if (a_type == GGML_TYPE_Q6_K || (a_type == GGML_TYPE_Q8_0 && ctx->device->vendor_id == VK_VENDOR_ID_INTEL)) {
-            // the q6_k and q8_0 shaders with contiguous 16-bit loads are faster with one subgroup per workgroup on Intel
+        if (a_type == GGML_TYPE_Q6_K || ((a_type == GGML_TYPE_Q8_0 || a_type == GGML_TYPE_NVFP4) && ctx->device->vendor_id == VK_VENDOR_ID_INTEL)) {
+            // the q6_k, q8_0 and nvfp4 shaders with contiguous loads are faster with one subgroup per workgroup on Intel
             if (ctx->device->vendor_id != VK_VENDOR_ID_INTEL && m < 4096 && k >= 1024) {
                 dmmv_wg = DMMV_WG_SIZE_LARGE;
             }

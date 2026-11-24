@@ -1,0 +1,141 @@
+#version 450
+
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#if USE_SUBGROUP_ADD || USE_SUBGROUP_ADD_NO_SHMEM
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_shader_subgroup_ballot : require
+#define SHUFFLE_SCALES 1
+// value of thread c of the 16-thread group. On Intel Xe a broadcast from a constant lane is much cheaper than a shuffle.
+#define GROUP_LANE(v, c) (gl_SubgroupSize == 16 ? subgroupBroadcast(v, c) : subgroupShuffle(v, (gl_SubgroupInvocationID & ~15u) + c))
+#endif
+
+#include "mul_mat_vec_base.glsl"
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+// An nvfp4 block is 9 32-bit words: the 4 UE4M3 scales of its 16-value sub-blocks, then 8 words of E2M1 values.
+// Sub-block s is in words 1 + 2s and 2 + 2s; byte j of the sub-block holds value j (low nibble) and value 8 + j (high nibble).
+// 16 threads share a group of 16 blocks and handle two blocks at a time: thread t reads value word t % 8 of
+// block t / 8 of the pair, so the loads are contiguous. Thread t also reads the scale word of block t of the group
+// and shares it through the subgroup: a load of the same word by all threads is slow on Intel Xe.
+// The values are decoded with bit operations instead of the shared-memory tables of the generic shader.
+layout (binding = 0) readonly buffer A_U32 {uint32_t data_a_u32[];};
+
+#define WORDS_PER_BLOCK 9
+
+FLOAT_TYPE temp[NUM_COLS][NUM_ROWS];
+
+// UE4M3 scale byte -> float as ue4m3_to_fp32_build() in types.glsl, times 2^14 for nvfp4_values()
+float nvfp4_scale(const uint u) {
+    const uint em = u & 0x7Fu;
+    if (u == 127u) {
+        return 0.0;
+    }
+    // em < 8: subnormal man/512 (0 for em = 0); else 2^(exp - 7) * (1 + man/8), with the exponent raised by 14
+    return em < 8u ? float(em) * 32.0 : uintBitsToFloat((em << 20) + (134u << 23));
+}
+
+// four E2M1 values, one in the low nibble of each byte of n -> the values times 2^-14:
+// sign, exponent and mantissa bits placed into the low exponent and top mantissa bits of an f16
+vec4 nvfp4_values(const uint n) {
+    const uint p01 = (n & 0x000Fu) | ((n & 0x0F00u) << 8);
+    const uint p23 = ((n >> 16) & 0x000Fu) | ((n >> 8) & 0x000F0000u);
+    const uint h01 = ((p01 & 0x00070007u) << 9) | ((p01 & 0x00080008u) << 12);
+    const uint h23 = ((p23 & 0x00070007u) << 9) | ((p23 & 0x00080008u) << 12);
+    return vec4(unpackHalf2x16(h01), unpackHalf2x16(h23));
+}
+
+void calc_blocks(const uint blk0, const uint nb, const uint itid, const uint row_w0, const uint nw_row, const uint b_offset, const uint num_rows, const bool full) {
+    const uint w  = itid & 7u;      // value word of the block
+    const uint hb = itid >> 3;      // block of the pair
+    const uint s  = w >> 1;         // sub-block
+    const uint jb = (w & 1u) * 4u;  // first byte of the word in the sub-block
+
+#ifdef SHUFFLE_SCALES
+    uint dsh[NUM_ROWS][16];
+    [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+        const uint dl = data_a_u32[row_w0 + n * nw_row + min(blk0 + itid, nb - 1) * WORDS_PER_BLOCK];
+        dsh[n][ 0] = GROUP_LANE(dl,  0); dsh[n][ 1] = GROUP_LANE(dl,  1); dsh[n][ 2] = GROUP_LANE(dl,  2); dsh[n][ 3] = GROUP_LANE(dl,  3);
+        dsh[n][ 4] = GROUP_LANE(dl,  4); dsh[n][ 5] = GROUP_LANE(dl,  5); dsh[n][ 6] = GROUP_LANE(dl,  6); dsh[n][ 7] = GROUP_LANE(dl,  7);
+        dsh[n][ 8] = GROUP_LANE(dl,  8); dsh[n][ 9] = GROUP_LANE(dl,  9); dsh[n][10] = GROUP_LANE(dl, 10); dsh[n][11] = GROUP_LANE(dl, 11);
+        dsh[n][12] = GROUP_LANE(dl, 12); dsh[n][13] = GROUP_LANE(dl, 13); dsh[n][14] = GROUP_LANE(dl, 14); dsh[n][15] = GROUP_LANE(dl, 15);
+    }
+#endif
+
+    [[unroll]] for (uint pp = 0; pp < 8; ++pp) {
+        if (!full && blk0 + 2 * pp >= nb) {
+            break;
+        }
+        const uint blk = blk0 + 2 * pp + hb;
+        if (!full && blk >= nb) {
+            continue;
+        }
+
+        vec4 bl[NUM_COLS], bh[NUM_COLS];
+        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+            const uint bi = (j * p.batch_stride_b + b_offset + blk * QUANT_K + s * 16 + jb) / 4;
+            bl[j] = vec4(data_b_v4[bi]);
+            bh[j] = vec4(data_b_v4[bi + 2]);
+        }
+
+        [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+            const uint bw = row_w0 + n * nw_row + blk * WORDS_PER_BLOCK;
+            const uint qw = data_a_u32[bw + 1 + w];
+#ifdef SHUFFLE_SCALES
+            const uint dw = hb == 0 ? dsh[n][2 * pp] : dsh[n][2 * pp + 1];
+#else
+            const uint dw = data_a_u32[bw];
+#endif
+            const FLOAT_TYPE d = FLOAT_TYPE(nvfp4_scale(bitfieldExtract(dw, int(8 * s), 8)));
+            const vec4 vl = nvfp4_values(qw & 0x0F0F0F0Fu);
+            const vec4 vh = nvfp4_values((qw >> 4) & 0x0F0F0F0Fu);
+            [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+                temp[j][n] = fma(d, FLOAT_TYPE(dot(vl, bl[j]) + dot(vh, bh[j])), temp[j][n]);
+            }
+        }
+    }
+}
+
+void compute_outputs(const uint first_row, const uint num_rows) {
+    uint a_offset, b_offset, d_offset;
+    get_offsets(a_offset, b_offset, d_offset);
+
+    const uint nb = p.ncols / QUANT_K;
+    const uint nw_row = nb * WORDS_PER_BLOCK;
+    const uint row_w0 = (a_offset + first_row * nb) * WORDS_PER_BLOCK;
+
+    const uint tid = gl_LocalInvocationID.x;
+    const uint itid = tid % 16;
+    const uint ix = tid / 16;
+    const uint it_size = gl_WorkGroupSize.x / 16;
+
+    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+            temp[j][n] = FLOAT_TYPE(0);
+        }
+    }
+
+    uint blk0 = 16 * ix;
+    for (; blk0 + 16 <= nb; blk0 += 16 * it_size) {
+        calc_blocks(blk0, nb, itid, row_w0, nw_row, b_offset, num_rows, true);
+    }
+    if (blk0 < nb) {
+        calc_blocks(blk0, nb, itid, row_w0, nw_row, b_offset, num_rows, false);
+    }
+
+    reduce_result(temp, d_offset, first_row, num_rows, tid);
+}
+
+void main() {
+    const uint first_row = NUM_ROWS * (gl_WorkGroupID.x + gl_NumWorkGroups.x * gl_WorkGroupID.z);
+
+    // do NUM_ROWS at a time, unless there aren't enough remaining rows
+    if (first_row + NUM_ROWS <= p.stride_d) {
+        compute_outputs(first_row, NUM_ROWS);
+    } else {
+        if (first_row >= p.stride_d) {
+            return;
+        }
+        compute_outputs(first_row, p.stride_d - first_row);
+    }
+}
