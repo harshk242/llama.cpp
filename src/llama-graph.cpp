@@ -3103,6 +3103,20 @@ ggml_tensor * llm_graph_context::build_pos_bias(ggml_tensor * pos_bucket, ggml_t
     return pos_bias;
 }
 
+// LLAMA_FA_MAX_TOKENS (hybrid attention), -1 if not set
+static int64_t llama_fa_max_tokens() {
+    static const int64_t fa_max_tokens = [] {
+        const char * e = getenv("LLAMA_FA_MAX_TOKENS");
+        return e ? (int64_t) atoll(e) : (int64_t) -1;
+    }();
+    return fa_max_tokens;
+}
+
+bool llm_graph_context::use_fa_indexed_bias() const {
+    static const bool dense = getenv("LLAMA_FA_DENSE_BIAS") != nullptr;
+    return cparams.flash_attn && llama_fa_max_tokens() < 0 && !dense;
+}
+
 ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * q,
          ggml_tensor * k,
@@ -3133,10 +3147,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
     // Hybrid attention: with LLAMA_FA_MAX_TOKENS=N, keep the flash-attention KV layout but only use the
     // FA kernel for ubatches of <= N tokens (decode); larger ubatches (prefill) use mul_mat + soft_max.
-    static const int64_t fa_max_tokens = [] {
-        const char * e = getenv("LLAMA_FA_MAX_TOKENS");
-        return e ? (int64_t) atoll(e) : (int64_t) -1;
-    }();
+    const int64_t fa_max_tokens = llama_fa_max_tokens();
     const bool fa_hybrid_skip = fa_max_tokens >= 0 && kv_rows == nullptr && q->ne[1] > fa_max_tokens;
     const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr && !fa_hybrid_skip;
     GGML_ASSERT(use_flash_attn || kv_rows == nullptr);
@@ -3166,6 +3177,11 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         res->add_fused_node({kv_rows ? LLM_FUSED_OP_FLASH_ATTN_KV_ROWS : LLM_FUSED_OP_FLASH_ATTN, cur, il});
 
         ggml_flash_attn_ext_add_sinks(cur, sinks);
+        if (fa_bias_table) {
+            ggml_flash_attn_ext_add_indexed_bias(cur, fa_bias_table, fa_bias_indices);
+            fa_bias_table   = nullptr;
+            fa_bias_indices = nullptr;
+        }
         GGML_ASSERT(n_kv_max >= 0 && n_kv_max <= INT32_MAX);
         ggml_flash_attn_ext_set_n_kv_max(cur, static_cast<int32_t>(n_kv_max));
         ggml_prec_set_acc(cur, GGML_PREC_F32);
@@ -3189,6 +3205,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
     } else {
+        GGML_ASSERT(fa_bias_table == nullptr && "the indexed bias needs flash attention");
+
         ggml_tensor * kq = ggml_mul_mat(ctx0, k, q);
         cb(kq, "kq", il);
 
@@ -4419,7 +4437,8 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_tensor * kq_b,
         ggml_tensor * sinks,
             float     kq_scale,
-            int       il) const {
+            int       il,
+        ggml_tensor * bias_table) const {
     const bool is_swa = hparams.is_swa(il);
 
     auto * inp_attn = inp->get_attn();
@@ -4429,6 +4448,23 @@ ggml_tensor * llm_graph_context::build_attn(
     // TODO: support kv_rows - fill the distances over the kv_rows cell lists and pass the rows to build_attn_mha,
     //       needs a kv_rows flash attention with a per-head mask (CUDA has none)
     GGML_ASSERT(attn_mask.rows == nullptr);
+
+    if (bias_table) {
+        // the bias stays a [n_bins, n_head, n_tokens] table, flash attention adds it per key: no per-head mask
+        GGML_ASSERT(kq_b == nullptr && use_fa_indexed_bias());
+
+        ggml_tensor * kq_mask = attn_mask.raw;
+        if (kq_mask->type != GGML_TYPE_F16) {
+            kq_mask = ggml_cast(ctx0, kq_mask, GGML_TYPE_F16);
+        }
+
+        fa_bias_table   = bias_table;
+        fa_bias_indices = is_swa ? inp->self_rel_pos_swa : inp->self_rel_pos;
+
+        ggml_tensor * cur = build_attn_iswa_impl(*this, inp_attn, wo, wo_b, wo_s, q_cur, k_cur, v_cur, nullptr, kq_mask, nullptr, sinks, nullptr, kq_scale, il);
+        GGML_ASSERT(fa_bias_table == nullptr);
+        return cur;
+    }
 
     // a mask per head, in the dense layout of the input mask, which flash attention takes in F16
     ggml_tensor * kq_mask = attn_mask.raw;

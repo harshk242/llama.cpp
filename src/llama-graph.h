@@ -1088,6 +1088,10 @@ struct llm_graph_amax_src1 {
 struct llm_graph_context {
     const llama_model & model;
 
+    // indexed bias for the next flash attention node of build_attn_mha (set and cleared by build_attn)
+    mutable ggml_tensor * fa_bias_table   = nullptr;
+    mutable ggml_tensor * fa_bias_indices = nullptr;
+
     const llama_hparams & hparams;
     const llama_cparams & cparams;
     const llama_ubatch  & ubatch;
@@ -1546,7 +1550,14 @@ struct llm_graph_context {
             ggml_tensor * kq_b,  // [n_kv, n_tokens/n_stream, n_head_q, n_stream]
             ggml_tensor * sinks, // [n_head_q]
                   float   kq_scale,
-                    int   il) const;
+                    int   il,
+            ggml_tensor * bias_table = nullptr) const; // [n_bins, n_head_q, n_tokens], instead of kq_b: the bias of a key is
+                                                       // bias_table[rel_pos[key, query], head, query], added inside flash attention
+
+    // flash attention can take the relative-position bias as a compact table (ggml_flash_attn_ext_add_indexed_bias)
+    // instead of a dense per-head mask; false without flash attention, with LLAMA_FA_MAX_TOKENS (hybrid attention)
+    // or with LLAMA_FA_DENSE_BIAS set
+    bool use_fa_indexed_bias() const;
 
     //
     // pooling
