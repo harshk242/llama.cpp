@@ -26,6 +26,7 @@ layout (binding = 4) readonly buffer S {float data_s[];};
 layout (binding = 5) buffer OV4 {vec4 data_ov4[];};
 layout (binding = 6) readonly buffer BT {float data_bias_table[];};
 layout (binding = 7) readonly buffer BI {int data_bias_idx[];};
+layout (binding = 7) readonly buffer BI4 {ivec4 data_bias_idx4[];};
 
 layout (push_constant) uniform parameter
 {
@@ -541,9 +542,31 @@ void main() {
                     const uint bias_q = batch_idx * p.neq1 + bias_row;
                     const uint bias_t = (bias_q * p.neq2 + head_q_idx * gqa_fold + sg_o_r_h) * BiasBins;
                     const uint bias_col = loop * step_p + lane_r * softmax_loops;
-                    [[unroll]] for (uint idx = 0; idx < softmax_loops; ++idx) {
-                        if (!seq_boundary_check || bias_col + idx < p.nek1) {
-                            Pf[idx] += data_bias_table[bias_t + data_bias_idx[bias_q * p.nek1 + bias_col + idx]];
+                    const uint bias_i = bias_q * p.nek1 + bias_col;
+                    if (!seq_boundary_check && softmax_loops % 4 == 0 && p.nek1 % 4 == 0) {
+                        // keys at or past the extent share the last bin: skip the table gathers when all of them are there
+                        int bins[softmax_loops];
+                        bool far = true;
+                        [[unroll]] for (uint idx = 0; idx < softmax_loops / 4; ++idx) {
+                            const ivec4 b4 = data_bias_idx4[bias_i / 4 + idx];
+                            bins[4 * idx] = b4.x; bins[4 * idx + 1] = b4.y; bins[4 * idx + 2] = b4.z; bins[4 * idx + 3] = b4.w;
+                            far = far && all(equal(b4, ivec4(int(BiasBins) - 1)));
+                        }
+                        if (far) {
+                            const float bias_far = data_bias_table[bias_t + BiasBins - 1];
+                            [[unroll]] for (uint idx = 0; idx < softmax_loops; ++idx) {
+                                Pf[idx] += bias_far;
+                            }
+                        } else {
+                            [[unroll]] for (uint idx = 0; idx < softmax_loops; ++idx) {
+                                Pf[idx] += data_bias_table[bias_t + bins[idx]];
+                            }
+                        }
+                    } else {
+                        [[unroll]] for (uint idx = 0; idx < softmax_loops; ++idx) {
+                            if (!seq_boundary_check || bias_col + idx < p.nek1) {
+                                Pf[idx] += data_bias_table[bias_t + data_bias_idx[bias_i + idx]];
+                            }
                         }
                     }
                 }

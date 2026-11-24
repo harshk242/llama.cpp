@@ -14201,6 +14201,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
         return test_cases;
     }
+    if (getenv("INKLING_FA_PERF")) {
+        // prefill attention of Inkling 2 Mini at 32K depth, ub 512: SWA (n_kv 1536) and global (n_kv 33280) layers,
+        // 8 KV heads x 3, causal distance bins (extent 1024)
+        for (int64_t kv : {1536, 33280}) {
+            test_cases.emplace_back(new test_flash_attn_ext_indexed_bias(128, 8, 3, kv, 512, 1, 1025, false, true, GGML_TYPE_F16, true));
+        }
+        test_cases.emplace_back(new test_flash_attn_ext_indexed_bias(128, 8, 3, 33280, 1, 1, 1025, false, true, GGML_TYPE_F16, true));
+        return test_cases;
+    }
     if (getenv("GLM_BW_PERF")) {
         // 32768 x 576 f16 = 37.7 MB, the K cache of one layer at 32K
         test_cases.emplace_back(new test_cpy(GGML_TYPE_F16, GGML_TYPE_F16, {576, 32768, 1, 1}));
