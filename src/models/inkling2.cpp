@@ -257,7 +257,13 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
         }
     }
 
-    return ggml_scale(ctx0, ggml_add(ctx0, cur, out), 1.0f/sqrtf((dynamic ? 2 : 1)*n_conv + 1));
+    out = ggml_scale(ctx0, ggml_add(ctx0, cur, out), 1.0f/sqrtf((dynamic ? 2 : 1)*n_conv + 1));
+
+    // right after the state store: keeps the concat, store, conv and residual together in the graph order,
+    // where backends can fuse them (Vulkan SHORT_CONV)
+    ggml_build_forward_expand(gf, out);
+
+    return out;
 }
 
 // mix a cross-pass message into a looped layer input: (1 - forget)*cur + gain*message, both gated on cur and message
