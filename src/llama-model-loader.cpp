@@ -1460,6 +1460,17 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         return nullptr;
     }
 
+    // store a small F32 weight as F16 / BF16 to halve the bytes read per use (load_all_data converts the data)
+    // only in device buffers: a host buffer may map the file directly, and CPU F32 mat-vecs are not limited by this
+    if ((flags & (TENSOR_F32_TO_F16 | TENSOR_F32_TO_BF16)) && cur->type == GGML_TYPE_F32 && !is_lazy &&
+            !(flags & TENSOR_DUPLICATED) && !ggml_backend_buft_is_host(buft)) {
+        t_meta.type  = (flags & TENSOR_F32_TO_BF16) ? GGML_TYPE_BF16 : GGML_TYPE_F16;
+        t_meta.nb[0] = ggml_type_size(t_meta.type);
+        for (int dim = 1; dim < GGML_MAX_DIMS; dim++) {
+            t_meta.nb[dim] = t_meta.nb[dim-1]*t_meta.ne[dim-1];
+        }
+    }
+
     ggml_context * ctx = ctx_for_buft(buft);
 
     // if duplicated, check if the original tensor was allocated in the same buffer type context and avoid creating a new one
@@ -1792,6 +1803,36 @@ bool llama_model_loader::load_all_data(
         }
 
         size_t n_size = ggml_nbytes(cur);
+
+        // stored as F16 / BF16 while the file has F32 (TENSOR_F32_TO_F16 / TENSOR_F32_TO_BF16): read, convert, upload
+        if (cur->type != weight->tensor->type) {
+            GGML_ASSERT(weight->tensor->type == GGML_TYPE_F32 && (cur->type == GGML_TYPE_F16 || cur->type == GGML_TYPE_BF16));
+            const int64_t n = ggml_nelements(cur);
+            const size_t  n_file = ggml_nbytes(weight->tensor);
+            std::vector<float> f32;
+            const float * src;
+            if (use_mmap) {
+                src = (const float *) ((const uint8_t *) mappings.at(weight->idx)->addr() + weight->offs);
+            } else {
+                f32.resize(n);
+                const auto & file = files.at(weight->idx);
+                file->seek(weight->offs, SEEK_SET);
+                file->read_raw(f32.data(), n_file);
+                src = f32.data();
+            }
+            if (check_tensors && !ggml_validate_row_data(GGML_TYPE_F32, src, n_file)) {
+                throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
+            }
+            std::vector<uint16_t> half(n);
+            if (cur->type == GGML_TYPE_F16) {
+                ggml_fp32_to_fp16_row(src, (ggml_fp16_t *) half.data(), n);
+            } else {
+                ggml_fp32_to_bf16_row(src, (ggml_bf16_t *) half.data(), n);
+            }
+            ggml_backend_tensor_set(cur, half.data(), 0, n_size);
+            size_done += n_file; // size_data counts the file bytes
+            continue;
+        }
 
         const bool from_mapping = use_mmap || lazy.has(cur);
 

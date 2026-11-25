@@ -2507,6 +2507,11 @@ struct llama_model_inkling2 : public llama_model_base {
     // the layers stored in the file
     virtual int n_layer_phys() const { return hparams.n_layer(); }
 
+    // create_tensor flags of the F32 router and loop-control weights: stored as F16 in device buffers, which halves
+    // the bytes read per token (the file values are BF16 upcasts, all within the F16 range)
+    // LLAMA_INKLING_F32_CTRL=1 keeps F32, LLAMA_INKLING_CTRL_TYPE=bf16 stores BF16 (exact, but a slower mat-vec on Xe3)
+    static int ctrl_weight_flags();
+
     // message controllers of the q, k, v and ffn inputs of a looped layer (inkling2_loop)
     enum { LOOP_CTRL_Q, LOOP_CTRL_K, LOOP_CTRL_V, LOOP_CTRL_FFN, LOOP_CTRL_COUNT };
 

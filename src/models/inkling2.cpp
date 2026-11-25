@@ -81,6 +81,15 @@ void llama_model_inkling2::load_arch_hparams(llama_model_loader & ml) {
     type = LLM_TYPE_UNKNOWN;
 }
 
+int llama_model_inkling2::ctrl_weight_flags() {
+    const char * f32  = getenv("LLAMA_INKLING_F32_CTRL");
+    const char * type = getenv("LLAMA_INKLING_CTRL_TYPE");
+    if (f32 && atoi(f32)) {
+        return 0;
+    }
+    return type && strcmp(type, "bf16") == 0 ? llama_model_loader::TENSOR_F32_TO_BF16 : llama_model_loader::TENSOR_F32_TO_F16;
+}
+
 void llama_model_inkling2::load_arch_tensors(llama_model_loader &) {
     LLAMA_LOAD_LOCALS;
 
@@ -150,7 +159,7 @@ void llama_model_inkling2::load_arch_tensors(llama_model_loader &) {
 
         // MoE
         layer.ffn_norm         = create_tensor(tn(LLM_TENSOR_FFN_NORM,         "weight", i), {n_embd}, 0);
-        layer.ffn_gate_inp     = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,     "weight", i), {n_embd, n_expert}, 0);
+        layer.ffn_gate_inp     = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,     "weight", i), {n_embd, n_expert}, ctrl_weight_flags());
         layer.ffn_exp_probs_b  = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B,  "bias",   i), {n_expert}, TENSOR_NOT_REQUIRED);
         layer.ffn_gate_up_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "weight", i), {n_embd, 2*n_ff_exp, n_expert}, 0);
         layer.ffn_down_exps    = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS,    "weight", i), {n_ff_exp, n_embd, n_expert}, 0);
