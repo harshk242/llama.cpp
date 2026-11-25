@@ -1,0 +1,91 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#if defined(DATA_W_F16)
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#endif
+
+// Gated mix of a message into a stream (the loop control of Inkling 2), fused from
+//   f = mul_mat(w_forget, gate), g = mul_mat(w_gain, gate)
+//   dst = (cur - tanh(f)*cur) + tanh(g)*msg
+// for short gate rows (k <= 4*MAX_CHUNKS*subgroup size). One subgroup computes one output row: its lanes hold the row
+// of both weights in registers (contiguous vec4 loads) and walk TOKENS_PER_WG tokens, so prefill reads the weights
+// once per token tile, not once per token.
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+layout(constant_id = 1) const uint TOKENS_PER_WG = 32;
+
+#if defined(DATA_W_F16)
+#define W_VEC4 f16vec4
+#else
+#define W_VEC4 vec4
+#endif
+
+layout(binding = 0) readonly buffer WF { W_VEC4 data_wf[]; };
+layout(binding = 1) readonly buffer WG { W_VEC4 data_wg[]; };
+layout(binding = 2) readonly buffer G  { vec4 data_g[]; };
+layout(binding = 3) readonly buffer C  { float data_c[]; };
+layout(binding = 4) readonly buffer M  { float data_m[]; };
+layout(binding = 5) writeonly buffer D { float data_d[]; };
+
+layout(push_constant) uniform parameter {
+    uint nrows;
+    uint k4;
+    uint ntok;
+    uint wf_off4; uint wf_stride4;
+    uint wg_off4; uint wg_stride4;
+    uint g_off4;  uint g_stride4;
+    uint c_off;   uint c_stride;
+    uint m_off;   uint m_stride;
+    uint d_off;   uint d_stride;
+};
+
+#define MAX_CHUNKS 4
+
+// as op_tanh in unary.comp
+float tanh_f(const float x) {
+    return 1.0f - 2.0f / (exp(2.0f*x) + 1.0f);
+}
+
+void main() {
+    const uint lane = gl_SubgroupInvocationID;
+    const uint row  = gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID;
+
+    // whole subgroups leave, there is no barrier
+    if (row >= nrows) {
+        return;
+    }
+
+    vec4 wf[MAX_CHUNKS];
+    vec4 wg[MAX_CHUNKS];
+    [[unroll]] for (uint c = 0; c < MAX_CHUNKS; ++c) {
+        const uint i = c * gl_SubgroupSize + lane;
+        wf[c] = i < k4 ? vec4(data_wf[wf_off4 + row * wf_stride4 + i]) : vec4(0.0f);
+        wg[c] = i < k4 ? vec4(data_wg[wg_off4 + row * wg_stride4 + i]) : vec4(0.0f);
+    }
+
+    const uint t0 = gl_WorkGroupID.y * TOKENS_PER_WG;
+    const uint t1 = min(t0 + TOKENS_PER_WG, ntok);
+
+    for (uint t = t0; t < t1; ++t) {
+        vec2 s = vec2(0.0f);
+        [[unroll]] for (uint c = 0; c < MAX_CHUNKS; ++c) {
+            const uint i = c * gl_SubgroupSize + lane;
+            if (i < k4) {
+                const vec4 g = data_g[g_off4 + t * g_stride4 + i];
+                s.x += dot(wf[c], g);
+                s.y += dot(wg[c], g);
+            }
+        }
+        s = subgroupAdd(s);
+
+        if (lane == 0) {
+            const float cv = data_c[c_off + t * c_stride + row];
+            const float mv = data_m[m_off + t * m_stride + row];
+            data_d[d_off + t * d_stride + row] = (cv - tanh_f(s.x) * cv) + tanh_f(s.y) * mv;
+        }
+    }
+}

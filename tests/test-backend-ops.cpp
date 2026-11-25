@@ -4704,6 +4704,68 @@ struct test_add_unary_mul : public test_case {
     }
 };
 
+// Inkling 2 loop control as in src/models/inkling2.cpp control():
+// gate = down*rms_norm([cur; msg]), out = (cur - tanh(forget*gate)*cur) + tanh(gain*gate)*msg
+// The Vulkan backend fuses the gain / forget mat-vecs with the elementwise tail (CTRL_GATE).
+struct test_inkling_control : public test_case {
+    const ggml_type wtype;
+    const int64_t n_embd;
+    const int64_t rank;
+    const int64_t n_tokens;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "INKLING_CONTROL";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override {
+        // the CPU mat-vec rounds the gate to F16 / BF16 for 16-bit weights
+        return wtype == GGML_TYPE_F16 ? 1e-5 : wtype == GGML_TYPE_BF16 ? 1e-4 : 1e-7;
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR4(wtype, n_embd, rank, n_tokens);
+    }
+
+    test_inkling_control(ggml_type wtype = GGML_TYPE_F16, int64_t n_embd = 2304, int64_t rank = 64, int64_t n_tokens = 1)
+        : wtype(wtype), n_embd(n_embd), rank(rank), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * cur  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_tensor * msg  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_tensor * down = ggml_new_tensor_2d(ctx, wtype, 2*n_embd, rank);
+        ggml_tensor * gain = ggml_new_tensor_2d(ctx, wtype, rank, n_embd);
+        ggml_tensor * forget = ggml_new_tensor_2d(ctx, wtype, rank, n_embd);
+        ggml_set_name(cur, "cur");
+        ggml_set_name(msg, "msg");
+
+        ggml_tensor * gate = ggml_concat(ctx, ggml_reshape_3d(ctx, cur, n_embd, 1, n_tokens), ggml_reshape_3d(ctx, msg, n_embd, 1, n_tokens), 1);
+        gate = ggml_reshape_2d(ctx, ggml_rms_norm(ctx, gate, 1e-6f), 2*n_embd, n_tokens);
+        gate = ggml_mul_mat(ctx, down, gate);
+
+        ggml_tensor * g = ggml_tanh(ctx, ggml_mul_mat(ctx, gain,   gate));
+        ggml_tensor * f = ggml_tanh(ctx, ggml_mul_mat(ctx, forget, gate));
+
+        ggml_tensor * out = ggml_add(ctx, ggml_sub(ctx, cur, ggml_mul(ctx, f, cur)), ggml_mul(ctx, g, msg));
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            const std::string name = ggml_get_name(t);
+            if (name == "cur" || name == "msg") {
+                init_tensor_uniform(t, -2.0f, 2.0f);
+            } else {
+                // weights of the model's scale: |gate| ~ 1, |gain*gate| ~ 1
+                init_tensor_uniform(t, -0.1f, 0.1f);
+            }
+        }
+    }
+};
+
 // SNAKE activation fusion: y = x + sin(a*x)^2 * inv_b
 // CUDA backend matches the naive 5-op chain (mul, sin, sqr, mul, add)
 // and dispatches a single fused kernel.
@@ -14144,6 +14206,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    for (ggml_type wtype : { GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_BF16 }) {
+        for (int64_t n_tokens : { 1, 2, 7, 33, 512 }) {
+            test_cases.emplace_back(new test_inkling_control(wtype, 2304, 64, n_tokens));
+        }
+    }
+    test_cases.emplace_back(new test_inkling_control(GGML_TYPE_F16, 1000, 36, 5));  // rows not a multiple of the WG, k not of 64
+    test_cases.emplace_back(new test_inkling_control(GGML_TYPE_F16, 256, 256, 3));  // longest gate the fusion takes
+    test_cases.emplace_back(new test_inkling_control(GGML_TYPE_F16, 256, 260, 3));  // too long: not fused
+    test_cases.emplace_back(new test_inkling_control(GGML_TYPE_F16, 256, 30, 3));   // k % 4 != 0: not fused
     return test_cases;
 }
 #ifdef _MSC_VER
@@ -14484,6 +14555,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_group_norm(GGML_TYPE_F32, {3, 1, 1, 65537}, 1));
 
     // SNAKE activation fusion at BigVGAN scale (T=7680 = 24 kHz x 320 ms, C=192)
+    // the Inkling loop control at the model shape, decode and prefill
+    test_cases.emplace_back(new test_inkling_control(GGML_TYPE_F16, 2304, 64, 1));
+    test_cases.emplace_back(new test_inkling_control(GGML_TYPE_F16, 2304, 64, 1024));
     test_cases.emplace_back(new test_snake_fuse(GGML_TYPE_F32,  {7680, 192, 1, 1}));
     test_cases.emplace_back(new test_snake_fuse(GGML_TYPE_F16,  {7680, 192, 1, 1}));
     test_cases.emplace_back(new test_snake_fuse(GGML_TYPE_BF16, {7680, 192, 1, 1}));

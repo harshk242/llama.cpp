@@ -232,6 +232,18 @@ struct vk_op_dsv4_hc_pre_push_constants {
     float scale;
 };
 
+struct vk_op_ctrl_gate_push_constants {
+    uint32_t nrows;
+    uint32_t k4;
+    uint32_t ntok;
+    uint32_t wf_off4; uint32_t wf_stride4;
+    uint32_t wg_off4; uint32_t wg_stride4;
+    uint32_t g_off4;  uint32_t g_stride4;
+    uint32_t c_off;   uint32_t c_stride;
+    uint32_t m_off;   uint32_t m_stride;
+    uint32_t d_off;   uint32_t d_stride;
+};
+
 struct vk_op_dsv4_hc_post_push_constants {
     uint32_t n_embd;
     uint32_t n_tokens;

@@ -603,6 +603,20 @@ static constexpr std::initializer_list<std::array<int, 3>> hc_post_gate_edges {
     { 3, 2, 2 }, // hc_post->src[2] == scale (post)
 };
 
+// Inkling 2 loop control: (cur - tanh(w_forget*gate)*cur) + tanh(w_gain*gate)*msg
+static constexpr std::initializer_list<ggml_op> ctrl_gate_pattern { GGML_OP_MUL_MAT, GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_SUB,
+                                                                    GGML_OP_MUL_MAT, GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_ADD };
+
+static constexpr std::initializer_list<std::array<int, 3>> ctrl_gate_edges {
+    { 1, 0, 0 }, // tanh->src[0] == mul_mat (forget)
+    { 2, 0, 1 }, // mul->src[0]  == tanh
+    { 3, 1, 2 }, // sub->src[1]  == mul
+    { 5, 0, 4 }, // tanh->src[0] == mul_mat (gain)
+    { 6, 0, 5 }, // mul->src[0]  == tanh
+    { 7, 0, 3 }, // add->src[0]  == sub
+    { 7, 1, 6 }, // add->src[1]  == mul
+};
+
 static constexpr std::initializer_list<std::array<int, 3>> topk_moe_early_softmax_norm_edges {
     { 1, 0, 0 }, // reshape->src[0]  == softmax
     { 2, 0, 0 }, // argsort->src[0]  == softmax
@@ -1004,6 +1018,9 @@ struct vk_device_struct {
     vk_pipeline pipeline_dsv4_hc_pre_gated_f32;
     vk_pipeline pipeline_dsv4_hc_post_f32;
     vk_pipeline pipeline_dsv4_hc_post_nocomb_f32;
+    vk_pipeline pipeline_ctrl_gate_f32;
+    vk_pipeline pipeline_ctrl_gate_f16;
+    uint32_t ctrl_gate_subgroup_size {};
     vk_pipeline pipeline_top_k_mask_f16;
     vk_pipeline pipeline_top_k_mask_f32;
     std::map<vk_solve_tri_pipeline_state, vk_pipeline> pipeline_solve_tri_f32;
@@ -1380,6 +1397,7 @@ struct ggml_backend_vk_context {
     // QSA indexer gather+add+top_k fused into one radix-select
     bool fused_topk_qsa {};
     bool fused_hc_post_gate {};
+    bool fused_ctrl_gate {};
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};
     // soft_max followed by a cast to f16
     bool fused_soft_max_f16 {};
