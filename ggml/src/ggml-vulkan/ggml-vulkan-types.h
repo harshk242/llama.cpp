@@ -621,6 +621,9 @@ static constexpr std::initializer_list<std::array<int, 3>> ctrl_gate_edges {
 static constexpr std::initializer_list<ggml_op> situ_pattern { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_MUL,
                                                                GGML_OP_VIEW,  GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_MUL };
 
+// rms_norm of two rows concatenated along dim 1 (Inkling 2 control(): [norm(cur); norm(msg)])
+static constexpr std::initializer_list<ggml_op> concat_rms_norm_pattern { GGML_OP_CONCAT, GGML_OP_RMS_NORM };
+
 // Inkling 2 clip(): [mul by a per-channel scale,] l2_norm, scale [, mul by the per-token tau]
 static constexpr std::initializer_list<ggml_op> clip_mul_tau_pattern { GGML_OP_MUL, GGML_OP_L2_NORM, GGML_OP_SCALE, GGML_OP_MUL };
 static constexpr std::initializer_list<ggml_op> clip_mul_pattern     { GGML_OP_MUL, GGML_OP_L2_NORM, GGML_OP_SCALE };
@@ -1075,6 +1078,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_situ_f32;
     vk_pipeline pipeline_clip_f32;
     vk_pipeline pipeline_short_conv_f32;
+    vk_pipeline pipeline_rms_norm_pair_f32;
     uint32_t ctrl_gate_subgroup_size {};
     vk_pipeline pipeline_top_k_mask_f16;
     vk_pipeline pipeline_top_k_mask_f32;
@@ -1460,6 +1464,7 @@ struct ggml_backend_vk_context {
     int fused_clip {};
     // 0 = none, else the number of fused nodes
     int fused_short_conv {};
+    bool fused_rms_norm_pair {};
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};
     // soft_max followed by a cast to f16
     bool fused_soft_max_f16 {};

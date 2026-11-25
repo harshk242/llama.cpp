@@ -1,0 +1,60 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// rms_norm(concat(a, b, 1)) for a, b [n, 1, T] (the gate input of the Inkling 2 loop control): row 0 of token t is
+// a[:, t], row 1 is b[:, t]; dst [n, 2, T]. One workgroup per row; the concatenation is never written.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer A { float data_a[]; };
+layout(binding = 1) readonly buffer B { float data_b[]; };
+layout(binding = 2) writeonly buffer D { float data_d[]; };
+
+layout(push_constant) uniform parameter {
+    uint n;
+    uint a_off; uint a_nb2;
+    uint b_off; uint b_nb2;
+    uint d_off; uint d_nb1; uint d_nb2;
+    float eps;
+};
+
+#define MAX_PER_THREAD 16
+
+shared float partial[64];
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint row = gl_WorkGroupID.x;
+    const uint t   = gl_WorkGroupID.y;
+
+    float v[MAX_PER_THREAD];
+    float ss = 0.0f;
+    [[unroll]] for (uint k = 0; k < MAX_PER_THREAD; ++k) {
+        const uint i = k * 256 + tid;
+        v[k] = 0.0f;
+        if (i < n) {
+            v[k] = row == 0 ? data_a[a_off + i + t * a_nb2] : data_b[b_off + i + t * b_nb2];
+            ss += v[k] * v[k];
+        }
+    }
+    ss = subgroupAdd(ss);
+    if (subgroupElect()) {
+        partial[gl_SubgroupID] = ss;
+    }
+    barrier();
+    ss = 0.0f;
+    for (uint g = 0; g < gl_NumSubgroups; ++g) {
+        ss += partial[g];
+    }
+
+    const float scale = inversesqrt(ss / float(n) + eps);
+    [[unroll]] for (uint k = 0; k < MAX_PER_THREAD; ++k) {
+        const uint i = k * 256 + tid;
+        if (i < n) {
+            data_d[d_off + i + row * d_nb1 + t * d_nb2] = scale * v[k];
+        }
+    }
+}

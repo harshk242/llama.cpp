@@ -275,6 +275,14 @@ struct vk_op_short_conv_push_constants {
     float scale;
 };
 
+struct vk_op_rms_norm_pair_push_constants {
+    uint32_t n;
+    uint32_t a_off; uint32_t a_nb2;
+    uint32_t b_off; uint32_t b_nb2;
+    uint32_t d_off; uint32_t d_nb1; uint32_t d_nb2;
+    float eps;
+};
+
 struct vk_op_ctrl_gate_push_constants {
     uint32_t nrows;
     uint32_t k4;
