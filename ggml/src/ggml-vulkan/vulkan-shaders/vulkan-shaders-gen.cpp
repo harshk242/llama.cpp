@@ -1098,6 +1098,7 @@ void process_shaders() {
     string_to_spv("depth_mix_f32", "depth_mix.comp", {});
     string_to_spv("situ_f32", "situ.comp", {});
     string_to_spv("clip_f32", "clip.comp", {});
+    string_to_spv("short_conv_f32", "short_conv.comp", {});
     string_to_spv("top_k_mask_f16", "top_k_mask.comp", {{"MASK_TYPE", "uint16_t"}});
     string_to_spv("top_k_mask_f32", "top_k_mask.comp", {{"MASK_TYPE", "uint"}});
     string_to_spv("cumsum_f32", "cumsum.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));

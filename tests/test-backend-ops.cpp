@@ -4827,6 +4827,7 @@ struct test_inkling_convolve : public test_case {
     const int64_t n_conv;
     const int64_t n_tokens;
     const int64_t n_seqs;
+    const bool    store;   // the copy of the last inputs to the conv state, as build_conv_state_store
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -4836,11 +4837,11 @@ struct test_inkling_convolve : public test_case {
     bool run_whole_graph() override { return true; }
 
     std::string vars() override {
-        return VARS_TO_STR4(n_channels, n_conv, n_tokens, n_seqs);
+        return VARS_TO_STR5(n_channels, n_conv, n_tokens, n_seqs, store);
     }
 
-    test_inkling_convolve(int64_t n_channels = 2304, int64_t n_conv = 4, int64_t n_tokens = 1, int64_t n_seqs = 1)
-        : n_channels(n_channels), n_conv(n_conv), n_tokens(n_tokens), n_seqs(n_seqs) {}
+    test_inkling_convolve(int64_t n_channels = 2304, int64_t n_conv = 4, int64_t n_tokens = 1, int64_t n_seqs = 1, bool store = false)
+        : n_channels(n_channels), n_conv(n_conv), n_tokens(n_tokens), n_seqs(n_seqs), store(store) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t n_seq_tokens = n_tokens / n_seqs;
@@ -4851,9 +4852,22 @@ struct test_inkling_convolve : public test_case {
         ggml_tensor * x = ggml_transpose(ctx, ggml_reshape_3d(ctx, cur, n_channels, n_seq_tokens, n_seqs));
         x = ggml_concat(ctx, past, x, 0);
 
+        // the state cell is read back through the result: concat(cpy, out) puts the cpy before the conv in the
+        // graph, as the explicit expand of the state store in the model
+        ggml_tensor * cpy = nullptr;
+        if (store) {
+            ggml_tensor * state = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_channels, 2*(n_conv - 1)*n_seqs);
+            ggml_tensor * last  = ggml_view_3d(ctx, x, n_conv - 1, n_channels, n_seqs, x->nb[1], x->nb[2], ggml_row_size(x->type, n_seq_tokens));
+            ggml_tensor * cell  = ggml_view_2d(ctx, state, n_channels, (n_conv - 1)*n_seqs, state->nb[1], (n_conv - 1)*n_seqs*state->nb[1]);
+            cpy = ggml_cpy(ctx, last, cell);
+        }
+
         ggml_tensor * out = ggml_ssm_conv(ctx, x, weight);
         out = ggml_reshape_2d(ctx, out, n_channels, n_tokens);
         out = ggml_scale(ctx, ggml_add(ctx, cur, out), 1.0f/sqrtf(n_conv + 1));
+        if (cpy) {
+            out = ggml_concat(ctx, cpy, out, 1);
+        }
         ggml_set_name(out, "out");
         return out;
     }
@@ -14393,6 +14407,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_inkling_convolve(1024, 4, n_tokens, 1));
     }
     test_cases.emplace_back(new test_inkling_convolve(100, 3, 5, 1));
+    for (int64_t n_tokens : { 1, 2, 3, 7, 512 }) {
+        test_cases.emplace_back(new test_inkling_convolve(2304, 4, n_tokens, 1, true));
+    }
+    test_cases.emplace_back(new test_inkling_convolve(100, 3, 1, 1, true));
+    test_cases.emplace_back(new test_inkling_convolve(1024, 4, 6, 2, true));  // two sequences: not fused
     for (int64_t n_tokens : { 1, 3, 512 }) {
         test_cases.emplace_back(new test_situ(1152, 8, n_tokens));
     }

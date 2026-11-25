@@ -626,6 +626,12 @@ static constexpr std::initializer_list<ggml_op> clip_mul_tau_pattern { GGML_OP_M
 static constexpr std::initializer_list<ggml_op> clip_mul_pattern     { GGML_OP_MUL, GGML_OP_L2_NORM, GGML_OP_SCALE };
 static constexpr std::initializer_list<ggml_op> clip_pattern         { GGML_OP_L2_NORM, GGML_OP_SCALE };
 
+// Inkling 2 convolve() with the conv state store: concat(past, x), cpy of its last columns to the state,
+// (cur + ssm_conv(concat))*scale. The VIEW of the state cell (an external input) may sit at index 2, see
+// ggml_vk_can_fuse_short_conv.
+static constexpr std::initializer_list<ggml_op> short_conv_pattern { GGML_OP_CONCAT, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_CPY,
+                                                                     GGML_OP_SSM_CONV, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_SCALE };
+
 // Inkling 2 convolve(): (cur + ssm_conv(x))*scale
 static constexpr std::initializer_list<ggml_op> ssm_conv_res_scale_pattern { GGML_OP_SSM_CONV, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_SCALE };
 
@@ -1068,6 +1074,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_depth_mix_f32;
     vk_pipeline pipeline_situ_f32;
     vk_pipeline pipeline_clip_f32;
+    vk_pipeline pipeline_short_conv_f32;
     uint32_t ctrl_gate_subgroup_size {};
     vk_pipeline pipeline_top_k_mask_f16;
     vk_pipeline pipeline_top_k_mask_f32;
@@ -1451,6 +1458,8 @@ struct ggml_backend_vk_context {
     bool fused_situ {};
     // 0 = none, else the clip pattern size
     int fused_clip {};
+    // 0 = none, else the number of fused nodes
+    int fused_short_conv {};
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};
     // soft_max followed by a cast to f16
     bool fused_soft_max_f16 {};

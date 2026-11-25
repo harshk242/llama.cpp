@@ -264,6 +264,17 @@ struct vk_op_clip_push_constants {
     float scale;
 };
 
+struct vk_op_short_conv_push_constants {
+    uint32_t nc; uint32_t nch; uint32_t ntok;
+    uint32_t p_off; uint32_t p_nb0; uint32_t p_nb1;
+    uint32_t x_off; uint32_t x_nb0; uint32_t x_nb1;
+    uint32_t w_off; uint32_t w_nb1;
+    uint32_t r_off; uint32_t r_nb1;
+    uint32_t s_off;
+    uint32_t d_off; uint32_t d_nb1;
+    float scale;
+};
+
 struct vk_op_ctrl_gate_push_constants {
     uint32_t nrows;
     uint32_t k4;

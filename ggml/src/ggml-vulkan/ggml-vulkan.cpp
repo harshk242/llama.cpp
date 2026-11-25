@@ -4121,6 +4121,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         ggml_vk_create_pipeline(device, device->pipeline_clip_f32, "clip_f32", clip_f32_len, clip_f32_data, "main", 4, sizeof(vk_op_clip_push_constants), {1, 1, 1}, { 128 }, 1, true, true, required);
         device->ctrl_gate_subgroup_size = sg;
     }
+    ggml_vk_create_pipeline(device, device->pipeline_short_conv_f32, "short_conv_f32", short_conv_f32_len, short_conv_f32_data, "main", 6, sizeof(vk_op_short_conv_push_constants), {1, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_situ_f32, "situ_f32", situ_f32_len, situ_f32_data, "main", 3, sizeof(vk_op_situ_push_constants), {1, 1, 1}, {}, 1);
     if (device->subgroup_arithmetic && device->subgroup_size >= 8 && device->properties.limits.maxComputeWorkGroupInvocations >= 1024) {
         ggml_vk_create_pipeline(device, device->pipeline_depth_mix_f32, "depth_mix_f32", depth_mix_f32_len, depth_mix_f32_data, "main", 4, sizeof(vk_op_depth_mix_push_constants), {1, 1, 1}, { 1024 }, 1, true, device->subgroup_require_full_support);
@@ -8170,6 +8171,53 @@ void ggml_vk_dsv4_hc_pre(ggml_backend_vk_context * ctx, vk_context& subctx, cons
     init_pushconst_tensor_offsets(ctx, pc, x, weights, nullptr, nullptr, dst);
 
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { x_buf, w_buf, d_buf }, pc, { n_embd, n_tokens, 1 });
+}
+
+// the short_conv_pattern nodes, with (8) or without (7) the VIEW of the state cell at index 2
+struct vk_short_conv_nodes {
+    const ggml_tensor * concat;
+    const ggml_tensor * last;   // view of the last concat columns
+    const ggml_tensor * cpy;
+    const ggml_tensor * conv;
+    const ggml_tensor * add;
+    const ggml_tensor * scale;
+};
+
+static vk_short_conv_nodes ggml_vk_short_conv_nodes(const ggml_cgraph * cgraph, int node_idx, int n_nodes) {
+    const int v = n_nodes == 8 ? 1 : 0;
+    return { cgraph->nodes[node_idx], cgraph->nodes[node_idx + 1], cgraph->nodes[node_idx + 2 + v], cgraph->nodes[node_idx + 3 + v],
+             cgraph->nodes[node_idx + 5 + v], cgraph->nodes[node_idx + 6 + v] };
+}
+
+void ggml_vk_short_conv(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_cgraph * cgraph, int node_idx, int n_nodes) {
+    const vk_short_conv_nodes n = ggml_vk_short_conv_nodes(cgraph, node_idx, n_nodes);
+    const ggml_tensor * past = n.concat->src[0];
+    const ggml_tensor * x    = n.concat->src[1];
+    const ggml_tensor * w    = n.conv->src[1];
+    const ggml_tensor * res  = n.add->src[0];
+    const ggml_tensor * st   = n.cpy;
+    ggml_tensor       * dst  = cgraph->nodes[node_idx + n_nodes - 1];
+
+    vk_pipeline pipeline = ctx->device->pipeline_short_conv_f32;
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    const uint32_t nch  = (uint32_t) n.conv->ne[0];
+    const uint32_t ntok = (uint32_t) n.conv->ne[1];
+    vk_op_short_conv_push_constants pc = {
+        (uint32_t) w->ne[0], nch, ntok,
+        get_misalign_bytes(ctx, past) / 4, (uint32_t) (past->nb[0] / 4), (uint32_t) (past->nb[1] / 4),
+        get_misalign_bytes(ctx, x) / 4, (uint32_t) (x->nb[0] / 4), (uint32_t) (x->nb[1] / 4),
+        get_misalign_bytes(ctx, w) / 4, (uint32_t) (w->nb[1] / 4),
+        get_misalign_bytes(ctx, res) / 4, (uint32_t) (res->nb[1] / 4),
+        get_misalign_bytes(ctx, st) / 4,
+        get_misalign_bytes(ctx, dst) / 4, (uint32_t) (dst->nb[1] / 4),
+        ggml_get_op_params_f32(n.scale, 0),
+    };
+
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        { ggml_vk_tensor_subbuffer(ctx, past, true), ggml_vk_tensor_subbuffer(ctx, x, true), ggml_vk_tensor_subbuffer(ctx, w, true),
+          ggml_vk_tensor_subbuffer(ctx, res, true), ggml_vk_tensor_subbuffer(ctx, st, true), ggml_vk_tensor_subbuffer(ctx, dst, true) },
+        pc, { CEIL_DIV(nch, 256u), ntok, 1 });
 }
 
 // nodes: clip_mul_tau_pattern, clip_mul_pattern or clip_pattern (n_nodes 4, 3, 2), see ggml_vk_can_fuse_clip
@@ -13866,7 +13914,9 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
 
         break;
     case GGML_OP_CONCAT:
-        if (ctx->fused_depth_mix) {
+        if (ctx->fused_short_conv) {
+            ggml_vk_short_conv(ctx, compute_ctx, cgraph, node_idx, ctx->fused_short_conv);
+        } else if (ctx->fused_depth_mix) {
             ggml_vk_depth_mix(ctx, compute_ctx, cgraph, node_idx, ctx->num_additional_fused_ops + 1);
         } else {
             ggml_vk_concat(ctx, compute_ctx, src0, src1, node);
@@ -15039,6 +15089,56 @@ static bool ggml_vk_can_fuse_unary_mul_pair(const struct ggml_cgraph * cgraph, i
 }
 
 // the situ_pattern without its VIEW node (the view of up is an input, not an elided node)
+// returns the number of fused nodes (8 with the VIEW of the state cell inside, 7 without), 0 if not
+static int ggml_vk_can_fuse_short_conv(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    if (node_idx + 7 > cgraph->n_nodes) {
+        return 0;
+    }
+    // concat, view (last columns), [view (state cell),] cpy, ssm_conv, reshape, add, scale
+    static constexpr ggml_op ops[] = { GGML_OP_CONCAT, GGML_OP_VIEW, GGML_OP_CPY, GGML_OP_SSM_CONV, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_SCALE };
+    const int nn = cgraph->nodes[node_idx + 2]->op == GGML_OP_VIEW ? 8 : 7;
+    int idxs[7];
+    for (int k = 0; k < 7; ++k) {
+        idxs[k] = node_idx + k + (nn == 8 && k >= 2 ? 1 : 0);
+    }
+    // the cpy writes the state, the scale is the result
+    const int outs[2] = { idxs[2], idxs[6] };
+    if (idxs[6] >= cgraph->n_nodes || !ggml_can_fuse_subgraph_ext(cgraph, idxs, 7, ops, outs, 2)) {
+        return 0;
+    }
+    const vk_short_conv_nodes n = ggml_vk_short_conv_nodes(cgraph, node_idx, nn);
+    const ggml_tensor * reshape = cgraph->nodes[idxs[4]];
+    const ggml_tensor * past = n.concat->src[0];
+    const ggml_tensor * x    = n.concat->src[1];
+    const ggml_tensor * w    = n.conv->src[1];
+    const ggml_tensor * res  = n.add->src[0];
+    const int64_t nc   = w->ne[0];
+    const int64_t nch  = n.conv->ne[0];
+    const int64_t ntok = n.conv->ne[1];
+
+    if (n.last->src[0] != n.concat || n.cpy->src[0] != n.last || n.conv->src[0] != n.concat || reshape->src[0] != n.conv ||
+        n.add->src[1] != reshape || n.scale->src[0] != n.add || ggml_get_op_params_i32(n.concat, 0) != 0 ||
+        ggml_get_op_params_f32(n.scale, 1) != 0.0f) {
+        return 0;
+    }
+    for (const ggml_tensor * t : { past, x, w, res, n.concat, n.cpy, n.conv, n.add, n.scale }) {
+        if (t->type != GGML_TYPE_F32 || get_misalign_bytes(ctx, t) % 4) {
+            return 0;
+        }
+    }
+    // one sequence, past [nc - 1, ch], x [T, ch], the state cell the last nc - 1 columns, contiguous
+    if (n.conv->ne[2] != 1 || nc < 2 || past->ne[0] != nc - 1 || past->ne[1] != nch || past->ne[2] != 1 ||
+        x->ne[0] != ntok || x->ne[1] != nch || x->ne[2] != 1 || w->ne[1] != nch || w->nb[0] != 4 ||
+        n.last->ne[0] != nc - 1 || n.last->ne[1] != nch || n.last->ne[2] != 1 ||
+        n.last->view_offs != (size_t) ntok * n.concat->nb[0] || n.last->nb[1] != n.concat->nb[1] ||
+        ggml_nelements(n.cpy) != (nc - 1) * nch || !ggml_is_contiguous(n.cpy) ||
+        !ggml_are_same_shape(res, n.scale) || res->ne[0] != nch || res->ne[1] != ntok || res->nb[0] != 4 ||
+        n.scale->nb[0] != 4 || n.scale->ne[2] != 1) {
+        return 0;
+    }
+    return nn;
+}
+
 // returns the number of fused nodes (4, 3 or 2), 0 if not
 static int ggml_vk_can_fuse_clip(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
     if (ctx->device->ctrl_gate_subgroup_size == 0 || !ctx->device->pipeline_clip_f32) {
@@ -16164,6 +16264,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_depth_mix = false;
         ctx->fused_situ = false;
         ctx->fused_clip = 0;
+        ctx->fused_short_conv = 0;
         ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
         ctx->fused_soft_max_f16 = false;
         const char *fusion_string {};
@@ -16172,7 +16273,15 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             int n_mix = 0;
             int n_situ = 0;
             int n_clip = 0;
-            if ((cgraph->nodes[i]->op == GGML_OP_MUL || cgraph->nodes[i]->op == GGML_OP_L2_NORM) &&
+            int n_conv = 0;
+            if (cgraph->nodes[i]->op == GGML_OP_CONCAT && (n_conv = ggml_vk_can_fuse_short_conv(ctx, cgraph, i)) != 0) {
+                ctx->num_additional_fused_ops = n_conv - 1;
+                ctx->fused_short_conv = n_conv;
+                fusion_string = "SHORT_CONV";
+                // the cpy writes the conv state
+                ctx->fused_ops_write_mask |= 1 << (n_conv == 8 ? 3 : 2);
+                std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
+            } else if ((cgraph->nodes[i]->op == GGML_OP_MUL || cgraph->nodes[i]->op == GGML_OP_L2_NORM) &&
                 (n_clip = ggml_vk_can_fuse_clip(ctx, cgraph, i)) != 0) {
                 ctx->num_additional_fused_ops = n_clip - 1;
                 ctx->fused_clip = n_clip;
@@ -16436,6 +16545,10 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                         if (!src || src->op == GGML_OP_NONE) {
                             continue;
                         }
+                        // the destination operand of a fused cpy is that output itself
+                        if (cgraph->nodes[i + k]->op == GGML_OP_CPY && s == 1 && cgraph->nodes[i + k] == dst) {
+                            continue;
+                        }
                         if (ggml_vk_tensors_overlap(src, dst, op_srcs_fused_elementwise[k])) {
                             bool found = false;
                             for (int n = 0; n < k; ++n) {
@@ -16462,6 +16575,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_depth_mix = false;
                 ctx->fused_situ = false;
                 ctx->fused_clip = 0;
+                ctx->fused_short_conv = 0;
                 ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
                 ctx->fused_soft_max_f16 = false;
                 fusion_string = nullptr;
@@ -16751,14 +16865,25 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             return true;
         };
         bool kept_inkling = false;
-        for (const auto & pattern : { ctrl_gate_pattern, depth_mix_pattern, depth_mix_repeat_pattern, ssm_conv_res_scale_pattern, situ_pattern, clip_mul_tau_pattern, clip_mul_pattern, clip_pattern }) {
+        for (const auto & pattern : { ctrl_gate_pattern, depth_mix_pattern, depth_mix_repeat_pattern, ssm_conv_res_scale_pattern, situ_pattern, clip_mul_tau_pattern, clip_mul_pattern, clip_pattern, short_conv_pattern }) {
             if (match_inkling(pattern, first_unused)) {
                 add_pattern_alloc_deps(pattern, first_unused + (int) pattern.size() - 1);
-                // views first, so the computing nodes are consecutive
+                // views of tensors from outside the pattern first, so the computing nodes are consecutive
+                auto const &outside_view = [&](int n) -> bool {
+                    if (graph->nodes[n]->op != GGML_OP_VIEW) {
+                        return false;
+                    }
+                    for (size_t k = 0; k < pattern.size(); ++k) {
+                        if (graph->nodes[n]->view_src == graph->nodes[first_unused + k] || graph->nodes[n]->src[0] == graph->nodes[first_unused + k]) {
+                            return false;
+                        }
+                    }
+                    return true;
+                };
                 for (int pass = 0; pass < 2; ++pass) {
                     for (size_t j = 0; j < pattern.size(); ++j) {
                         const int n = first_unused + (int) j;
-                        if (!used[n] && (pattern.begin()[j] == GGML_OP_VIEW) == (pass == 0)) {
+                        if (!used[n] && outside_view(n) == (pass == 0)) {
                             new_order.push_back(graph->nodes[n]);
                             used_node_set.insert(graph->nodes[n]);
                             used[n] = true;
@@ -16804,7 +16929,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 return false;
             };
             auto const &in_inkling_pattern = [&](int n) -> bool {
-                for (const auto & pattern : { ctrl_gate_pattern, depth_mix_pattern, depth_mix_repeat_pattern, ssm_conv_res_scale_pattern, situ_pattern, clip_mul_tau_pattern, clip_mul_pattern, clip_pattern }) {
+                for (const auto & pattern : { ctrl_gate_pattern, depth_mix_pattern, depth_mix_repeat_pattern, ssm_conv_res_scale_pattern, situ_pattern, clip_mul_tau_pattern, clip_mul_pattern, clip_pattern, short_conv_pattern }) {
                     for (int o = 0; o < (int) pattern.size(); ++o) {
                         if (n - o >= 0 && match_inkling(pattern, n - o)) {
                             return true;

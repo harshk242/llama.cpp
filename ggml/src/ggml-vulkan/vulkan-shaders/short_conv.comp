@@ -1,0 +1,54 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+
+// The short causal convolution of Inkling 2 (convolve() without input-dependent taps, one sequence), fused from
+//   xs    = concat(past, x, 0)                       [nc - 1 + T, ch], past [nc - 1, ch], x[t, c] (a transposed view)
+//   state = xs[T .. T + nc - 2, :]                   (the CPY of the conv state store)
+//   dst   = (res + ssm_conv(xs, w)) * scale          [ch, T]
+// The concatenation is never written: the conv reads past and x directly. One thread per channel and token;
+// the threads of token 0 also write the new state of their channel.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer P { float data_p[]; };
+layout(binding = 1) readonly buffer X { float data_x[]; };
+layout(binding = 2) readonly buffer W { float data_w[]; };
+layout(binding = 3) readonly buffer R { float data_r[]; };
+layout(binding = 4) writeonly buffer S { float data_s[]; };
+layout(binding = 5) writeonly buffer D { float data_d[]; };
+
+layout(push_constant) uniform parameter {
+    uint nc; uint nch; uint ntok;
+    uint p_off; uint p_nb0; uint p_nb1;   // past[k, c]
+    uint x_off; uint x_nb0; uint x_nb1;   // x[t, c]
+    uint w_off; uint w_nb1;               // w[k, c]
+    uint r_off; uint r_nb1;               // res[c, t]
+    uint s_off;                           // state[j + c*(nc - 1)]
+    uint d_off; uint d_nb1;               // dst[c, t]
+    float scale;
+};
+
+float col(const uint k, const uint c) {
+    return k < nc - 1 ? data_p[p_off + k * p_nb0 + c * p_nb1] : data_x[x_off + (k - (nc - 1)) * x_nb0 + c * x_nb1];
+}
+
+void main() {
+    const uint c = gl_GlobalInvocationID.x;
+    const uint t = gl_WorkGroupID.y;
+    if (c >= nch) {
+        return;
+    }
+
+    float sum = 0.0f;
+    for (uint k = 0; k < nc; ++k) {
+        sum += col(t + k, c) * data_w[w_off + c * w_nb1 + k];
+    }
+    data_d[d_off + c + t * d_nb1] = (data_r[r_off + c + t * r_nb1] + sum) * scale;
+
+    if (t == 0) {
+        for (uint j = 0; j < nc - 1; ++j) {
+            data_s[s_off + j + c * (nc - 1)] = col(ntok + j, c);
+        }
+    }
+}
