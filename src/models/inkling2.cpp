@@ -308,9 +308,26 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
     const int64_t n_embd_head  = hparams.n_embd_head_k(il);
     const int64_t n_embd_k_gqa = n_embd_head*n_head_kv;
 
+    // row j of a mix() result [n_queries, n_embd, n_tokens] as [n_embd, n_tokens]
+    // one token: one transpose of all rows (none for a single query), then contiguous views instead of a copy per row
+    std::map<ggml_tensor *, ggml_tensor *> rows_t;
+    auto mixed_row = [&](ggml_tensor * mixed, int j) {
+        if (mixed->ne[0] == 1) {
+            return ggml_reshape_2d(ctx0, mixed, n_embd, n_tokens);
+        }
+        if (n_tokens == 1) {
+            ggml_tensor *& t = rows_t[mixed];
+            if (!t) {
+                t = ggml_cont(ctx0, ggml_transpose(ctx0, ggml_reshape_2d(ctx0, mixed, mixed->ne[0], n_embd)));
+            }
+            return ggml_view_2d(ctx0, t, n_embd, 1, t->nb[1], j*t->nb[1]);
+        }
+        return ggml_reshape_2d(ctx0, ggml_cont(ctx0, ggml_view_3d(ctx0, mixed, 1, n_embd, n_tokens, mixed->nb[1], mixed->nb[2], j*mixed->nb[0])), n_embd, n_tokens);
+    };
+
     // the message of controller ctrl, [n_embd, n_tokens]
     auto message = [&](int ctrl) {
-        return ggml_reshape_2d(ctx0, ggml_cont(ctx0, ggml_view_3d(ctx0, messages, 1, n_embd, n_tokens, messages->nb[1], messages->nb[2], ctrl*messages->nb[0])), n_embd, n_tokens);
+        return mixed_row(messages, ctrl);
     };
 
     ggml_tensor * state   = recr->mctx->get_r_l(il);
@@ -324,7 +341,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
     if (layer.attn_res_query) {
         ggml_tensor * mixed = mix(blocks, cur, layer.attn_res_query);
         for (int j = 0; j < 3; ++j) {
-            inputs[j] = ggml_reshape_2d(ctx0, ggml_cont(ctx0, ggml_view_3d(ctx0, mixed, 1, n_embd, n_tokens, mixed->nb[1], mixed->nb[2], (is_swa ? 0 : j)*mixed->nb[0])), n_embd, n_tokens);
+            inputs[j] = mixed_row(mixed, is_swa ? 0 : j);
         }
     }
 
