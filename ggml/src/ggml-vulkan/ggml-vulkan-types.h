@@ -621,6 +621,11 @@ static constexpr std::initializer_list<std::array<int, 3>> ctrl_gate_edges {
 static constexpr std::initializer_list<ggml_op> situ_pattern { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_MUL,
                                                                GGML_OP_VIEW,  GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_MUL };
 
+// Inkling 2 clip(): [mul by a per-channel scale,] l2_norm, scale [, mul by the per-token tau]
+static constexpr std::initializer_list<ggml_op> clip_mul_tau_pattern { GGML_OP_MUL, GGML_OP_L2_NORM, GGML_OP_SCALE, GGML_OP_MUL };
+static constexpr std::initializer_list<ggml_op> clip_mul_pattern     { GGML_OP_MUL, GGML_OP_L2_NORM, GGML_OP_SCALE };
+static constexpr std::initializer_list<ggml_op> clip_pattern         { GGML_OP_L2_NORM, GGML_OP_SCALE };
+
 // Inkling 2 convolve(): (cur + ssm_conv(x))*scale
 static constexpr std::initializer_list<ggml_op> ssm_conv_res_scale_pattern { GGML_OP_SSM_CONV, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_SCALE };
 
@@ -1062,6 +1067,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_ctrl_gate_f16;
     vk_pipeline pipeline_depth_mix_f32;
     vk_pipeline pipeline_situ_f32;
+    vk_pipeline pipeline_clip_f32;
     uint32_t ctrl_gate_subgroup_size {};
     vk_pipeline pipeline_top_k_mask_f16;
     vk_pipeline pipeline_top_k_mask_f32;
@@ -1443,6 +1449,8 @@ struct ggml_backend_vk_context {
     bool fused_ctrl_gate {};
     bool fused_depth_mix {};
     bool fused_situ {};
+    // 0 = none, else the clip pattern size
+    int fused_clip {};
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};
     // soft_max followed by a cast to f16
     bool fused_soft_max_f16 {};

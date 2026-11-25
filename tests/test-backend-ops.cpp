@@ -4904,6 +4904,44 @@ struct test_situ : public test_case {
     }
 };
 
+// Inkling 2 clip() as in src/models/inkling2.cpp: rows scaled to an L2 norm of at most t, after an optional per-channel
+// scale and before the optional per-token tau of the full-attention layers. The Vulkan backend fuses it (CLIP*).
+struct test_inkling_clip : public test_case {
+    const int64_t head_dim;
+    const int64_t n_head;
+    const int64_t n_tokens;
+    const bool has_w;
+    const bool has_tau;
+    const float t;
+
+    std::string op_desc(ggml_tensor * tensor) override {
+        GGML_UNUSED(tensor);
+        return "INKLING_CLIP";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR6(head_dim, n_head, n_tokens, has_w, has_tau, t);
+    }
+
+    test_inkling_clip(int64_t head_dim = 128, int64_t n_head = 24, int64_t n_tokens = 1, bool has_w = true, bool has_tau = false, float t = 4.0f)
+        : head_dim(head_dim), n_head(n_head), n_tokens(n_tokens), has_w(has_w), has_tau(has_tau), t(t) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_dim, n_head, n_tokens);
+        if (has_w) {
+            x = ggml_mul(ctx, x, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, head_dim, n_head));
+        }
+        ggml_tensor * out = ggml_scale(ctx, ggml_l2_norm(ctx, x, t), t);
+        if (has_tau) {
+            out = ggml_mul(ctx, out, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, 1, n_tokens));
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // SNAKE activation fusion: y = x + sin(a*x)^2 * inv_b
 // CUDA backend matches the naive 5-op chain (mul, sin, sqr, mul, add)
 // and dispatches a single fused kernel.
@@ -14359,6 +14397,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_situ(1152, 8, n_tokens));
     }
     test_cases.emplace_back(new test_situ(100, 3, 70, 2.0f, 0.5f));
+    for (int64_t n_tokens : { 1, 3, 512 }) {
+        for (auto [hd, nh] : std::vector<std::pair<int64_t, int64_t>>{ {128, 24}, {128, 8}, {16, 24} }) {
+            test_cases.emplace_back(new test_inkling_clip(hd, nh, n_tokens, true,  false));
+            test_cases.emplace_back(new test_inkling_clip(hd, nh, n_tokens, true,  true));
+            test_cases.emplace_back(new test_inkling_clip(hd, nh, n_tokens, false, false));
+        }
+    }
+    test_cases.emplace_back(new test_inkling_clip(37, 5, 3, true, true, 0.5f));    // odd row length, most rows clipped
+    test_cases.emplace_back(new test_inkling_clip(256, 4, 3, true, false));        // too long for 16 lanes: not fused
     test_cases.emplace_back(new test_inkling_convolve(1024, 4, 6, 2));  // two sequences: not fused
     test_cases.emplace_back(new test_inkling_mix(4096, 3, 2, 3));  // the most channels the fusion takes
     test_cases.emplace_back(new test_inkling_mix(4100, 3, 2, 3));  // too many: not fused

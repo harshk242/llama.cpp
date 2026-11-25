@@ -253,6 +253,17 @@ struct vk_op_situ_push_constants {
     float s2; float b2; float s3; float b3;
 };
 
+struct vk_op_clip_push_constants {
+    uint32_t ne00; uint32_t ne01; uint32_t nrows;
+    uint32_t x_off; uint32_t x_nb1; uint32_t x_nb2;
+    uint32_t w_off; uint32_t w_nb1;
+    uint32_t t_off; uint32_t t_nb2;
+    uint32_t d_off; uint32_t d_nb1; uint32_t d_nb2;
+    uint32_t has_w; uint32_t has_tau;
+    float eps;
+    float scale;
+};
+
 struct vk_op_ctrl_gate_push_constants {
     uint32_t nrows;
     uint32_t k4;

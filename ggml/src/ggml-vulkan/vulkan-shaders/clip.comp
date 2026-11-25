@@ -1,0 +1,69 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// clip() of Inkling 2, fused from [MUL by w,] L2_NORM(eps), SCALE(scale) [, MUL by tau]:
+//   y = x*w, dst = y/max(|y|, eps)*scale*tau[token]
+// w is [ne00, ne01] (per channel and head), tau one value per token. One subgroup per row of up to
+// MAX_PER_LANE*subgroup size elements, kept in registers between the two passes.
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+#define MAX_PER_LANE 8
+
+layout(binding = 0) readonly buffer X { float data_x[]; };
+layout(binding = 1) readonly buffer W { float data_w[]; };
+layout(binding = 2) readonly buffer T { float data_t[]; };
+layout(binding = 3) writeonly buffer D { float data_d[]; };
+
+layout(push_constant) uniform parameter {
+    uint ne00; uint ne01; uint nrows;
+    uint x_off; uint x_nb1; uint x_nb2;
+    uint w_off; uint w_nb1;
+    uint t_off; uint t_nb2;
+    uint d_off; uint d_nb1; uint d_nb2;
+    uint has_w; uint has_tau;
+    float eps;
+    float scale;
+};
+
+void main() {
+    const uint lane = gl_SubgroupInvocationID;
+    const uint row  = gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID;
+    if (row >= nrows) {
+        return;
+    }
+    const uint i1 = row % ne01;
+    const uint i2 = row / ne01;
+
+    float v[MAX_PER_LANE];
+    float ss = 0.0f;
+    [[unroll]] for (uint k = 0; k < MAX_PER_LANE; ++k) {
+        const uint i0 = k * gl_SubgroupSize + lane;
+        v[k] = 0.0f;
+        if (i0 < ne00) {
+            v[k] = data_x[x_off + i0 + i1 * x_nb1 + i2 * x_nb2];
+            if (has_w != 0) {
+                v[k] *= data_w[w_off + i0 + i1 * w_nb1];
+            }
+            ss += v[k] * v[k];
+        }
+    }
+    ss = subgroupAdd(ss);
+
+    const float f = 1.0f / max(sqrt(ss), eps);
+
+    [[unroll]] for (uint k = 0; k < MAX_PER_LANE; ++k) {
+        const uint i0 = k * gl_SubgroupSize + lane;
+        if (i0 < ne00) {
+            // the order of the unfused ops: (f*y)*scale, then *tau
+            float y = (f * v[k]) * scale;
+            if (has_tau != 0) {
+                y *= data_t[t_off + i2 * t_nb2];
+            }
+            data_d[d_off + i0 + i1 * d_nb1 + i2 * d_nb2] = y;
+        }
+    }
+}
