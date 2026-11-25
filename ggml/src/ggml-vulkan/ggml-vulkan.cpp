@@ -4322,6 +4322,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_f32,           "ssm_conv_f32",           ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 0, 0}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_silu_f32,      "ssm_conv_silu_f32",      ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 0, 1}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_bias_silu_f32, "ssm_conv_bias_silu_f32", ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 1, 1}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_res_scale_f32, "ssm_conv_res_scale_f32", ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 0, 0, 1}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_opt_step_adamw_f32, "opt_step_adamw_f32", opt_step_adamw_f32_len, opt_step_adamw_f32_data, "main", 5, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
 
@@ -10458,6 +10459,7 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
                 case 0:  return ctx->device->pipeline_ssm_conv_f32;
                 case 1:  return ctx->device->pipeline_ssm_conv_silu_f32;
                 case 2:  return ctx->device->pipeline_ssm_conv_bias_silu_f32;
+                case 3:  return ctx->device->pipeline_ssm_conv_res_scale_f32;
                 default: return nullptr;
             }
         }
@@ -10993,9 +10995,10 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
         break;
     case GGML_OP_SSM_CONV:
         {
+            // with a fused residual dst is 2d, n_t and n_s come from the push constants
             const uint32_t nr  = src0->ne[1];
-            const uint32_t n_t = dst->ne[1];
-            const uint32_t n_s = dst->ne[2];
+            const uint32_t n_t = ((const vk_op_ssm_conv_push_constants *) &pc)->n_t;
+            const uint32_t n_s = ((const vk_op_ssm_conv_push_constants *) &pc)->n_s;
             elements = { nr, n_t, n_s };
         }
         break;
@@ -11711,8 +11714,23 @@ void ggml_vk_ssm_conv(ggml_backend_vk_context * ctx, vk_context& subctx, const s
     // Fusion modes: 0 = ssm_conv, 1 = ssm_conv+silu, 2 = ssm_conv+add(bias)+silu.
     ggml_tensor * dst = conv;
     const ggml_tensor * bias = nullptr;
+    // mode 3 = ssm_conv+reshape+add(residual)+scale, the residual takes the bias binding
+    float scale = 1.0f;
+    uint32_t res_nb1 = 0;
+    uint32_t res_nb2 = 0;
+    uint32_t dst_nb1 = 0;
+    uint32_t dst_nb2 = 0;
 
-    if (ctx->num_additional_fused_ops == 1) {
+    if (ctx->num_additional_fused_ops == 3) {
+        const ggml_tensor * add = cgraph->nodes[node_idx + 2];
+        bias  = add->src[0];
+        dst   = cgraph->nodes[node_idx + 3];
+        scale = ggml_get_op_params_f32(dst, 0);
+        res_nb1 = (uint32_t) bias->nb[1];
+        res_nb2 = (uint32_t) (bias->nb[1] * conv->ne[1]);
+        dst_nb1 = (uint32_t) dst->nb[1];
+        dst_nb2 = (uint32_t) (dst->nb[1] * conv->ne[1]);
+    } else if (ctx->num_additional_fused_ops == 1) {
         dst = cgraph->nodes[node_idx + 1]; // silu
     } else if (ctx->num_additional_fused_ops == 2) {
         ggml_tensor * add = cgraph->nodes[node_idx + 1];
@@ -11723,15 +11741,17 @@ void ggml_vk_ssm_conv(ggml_backend_vk_context * ctx, vk_context& subctx, const s
     // The shader always declares 4 bindings; bind src0 as a dummy when bias isn't fused.
     const ggml_tensor * src2 = bias ? bias : src0;
 
+    const bool res = ctx->num_additional_fused_ops == 3;
     ggml_vk_op_f32<vk_op_ssm_conv_push_constants>(ctx, subctx, src0, src1, src2, nullptr, dst, GGML_OP_SSM_CONV, {
         (uint32_t)src0->nb[1], (uint32_t)src0->nb[2],
         (uint32_t)src1->nb[1],
-        (uint32_t)dst->nb[0], (uint32_t)dst->nb[1], (uint32_t)dst->nb[2],
+        (uint32_t)dst->nb[0], res ? dst_nb1 : (uint32_t)dst->nb[1], res ? dst_nb2 : (uint32_t)dst->nb[2],
         (uint32_t)src1->ne[0],
         (uint32_t)src0->ne[0],
         (uint32_t)src0->ne[1],
-        (uint32_t)dst->ne[1],
-        (uint32_t)dst->ne[2],
+        (uint32_t)conv->ne[1],
+        (uint32_t)conv->ne[2],
+        res_nb1, res_nb2, scale,
     });
 }
 
@@ -15297,6 +15317,24 @@ bool ggml_vk_can_fuse(const ggml_backend_vk_context * ctx, const struct ggml_cgr
     return true;
 }
 
+static bool ggml_vk_can_fuse_ssm_conv_res_scale(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    if (!ggml_can_fuse_subgraph(cgraph, node_idx, ssm_conv_res_scale_pattern, { node_idx + 3 }) ||
+        !ggml_check_edges(cgraph, node_idx, ssm_conv_res_scale_edges)) {
+        return false;
+    }
+    const ggml_tensor * conv  = cgraph->nodes[node_idx];
+    const ggml_tensor * add   = cgraph->nodes[node_idx + 2];
+    const ggml_tensor * scale = cgraph->nodes[node_idx + 3];
+    const ggml_tensor * res   = add->src[0];
+
+    // one sequence: the 2d residual and output rows are the conv tokens
+    return conv->type == GGML_TYPE_F32 && res->type == GGML_TYPE_F32 && add->type == GGML_TYPE_F32 && scale->type == GGML_TYPE_F32 &&
+           conv->ne[2] == 1 && ggml_are_same_shape(res, add) && ggml_are_same_shape(add, scale) &&
+           res->ne[0] == conv->ne[0] && res->ne[1] == conv->ne[1] && res->ne[2] == 1 && res->ne[3] == 1 &&
+           res->nb[0] == 4 && scale->nb[0] == 4 && ggml_get_op_params_f32(scale, 1) == 0.0f &&
+           get_misalign_bytes(ctx, res) == 0 && get_misalign_bytes(ctx, scale) == 0;
+}
+
 bool ggml_vk_can_fuse_ssm_conv(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph,
                                       int node_idx, int num_extra) {
     const ggml_tensor * conv = cgraph->nodes[node_idx];
@@ -16068,6 +16106,14 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 }
                 op_srcs_fused_elementwise[0] = true;
                 op_srcs_fused_elementwise[1] = true;
+            } else if (cgraph->nodes[i]->op == GGML_OP_SSM_CONV && ggml_vk_can_fuse_ssm_conv_res_scale(ctx, cgraph, i)) {
+                ctx->num_additional_fused_ops = 3;
+                fusion_string = "SSM_CONV_RES_SCALE";
+                // the conv reads several tokens of its input; the residual add and the scale are elementwise
+                op_srcs_fused_elementwise[0] = false;
+                op_srcs_fused_elementwise[1] = true;
+                op_srcs_fused_elementwise[2] = true;
+                op_srcs_fused_elementwise[3] = true;
             } else if (ggml_vk_can_fuse_ssm_conv(ctx, cgraph, i, 2)) {
                 ctx->num_additional_fused_ops = 2;
                 fusion_string = "SSM_CONV_BIAS_SILU";
@@ -16508,7 +16554,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
         }
         // the Inkling patterns have independent branches (the gain mat-vec), keep every node in place
         bool kept_inkling = false;
-        for (const auto & pattern : { ctrl_gate_pattern, depth_mix_pattern, depth_mix_repeat_pattern }) {
+        for (const auto & pattern : { ctrl_gate_pattern, depth_mix_pattern, depth_mix_repeat_pattern, ssm_conv_res_scale_pattern }) {
             if (match_pattern(pattern, first_unused)) {
                 add_pattern_alloc_deps(pattern, first_unused + (int) pattern.size() - 1);
                 keep_pattern(pattern);
@@ -16548,7 +16594,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 return false;
             };
             auto const &in_inkling_pattern = [&](int n) -> bool {
-                for (const auto & pattern : { ctrl_gate_pattern, depth_mix_pattern, depth_mix_repeat_pattern }) {
+                for (const auto & pattern : { ctrl_gate_pattern, depth_mix_pattern, depth_mix_repeat_pattern, ssm_conv_res_scale_pattern }) {
                     for (int o = 0; o < (int) pattern.size(); ++o) {
                         if (n - o >= 0 && match_pattern(pattern, n - o)) {
                             return true;

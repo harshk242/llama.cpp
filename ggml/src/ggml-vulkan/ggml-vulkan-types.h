@@ -617,6 +617,15 @@ static constexpr std::initializer_list<std::array<int, 3>> ctrl_gate_edges {
     { 7, 1, 6 }, // add->src[1]  == mul
 };
 
+// Inkling 2 convolve(): (cur + ssm_conv(x))*scale
+static constexpr std::initializer_list<ggml_op> ssm_conv_res_scale_pattern { GGML_OP_SSM_CONV, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_SCALE };
+
+static constexpr std::initializer_list<std::array<int, 3>> ssm_conv_res_scale_edges {
+    { 1, 0, 0 }, // reshape->src[0] == ssm_conv
+    { 2, 1, 1 }, // add->src[1]     == reshape
+    { 3, 0, 2 }, // scale->src[0]   == add
+};
+
 // Inkling 2 mix(): soft_max(states*query) weighted sum of the states, states = concat(a, b, 1)
 static constexpr std::initializer_list<ggml_op> depth_mix_pattern { GGML_OP_CONCAT, GGML_OP_MUL_MAT, GGML_OP_SOFT_MAX,
                                                                     GGML_OP_TRANSPOSE, GGML_OP_CONT, GGML_OP_MUL_MAT };
@@ -1080,6 +1089,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_ssm_conv_f32;
     vk_pipeline pipeline_ssm_conv_silu_f32;
     vk_pipeline pipeline_ssm_conv_bias_silu_f32;
+    vk_pipeline pipeline_ssm_conv_res_scale_f32;
     vk_pipeline pipeline_opt_step_adamw_f32;
     vk_pipeline pipeline_opt_step_sgd_f32;
     std::map<vk_conv2d_pipeline_state, vk_pipeline> pipeline_conv2d_f32[CONV_SHAPE_COUNT];

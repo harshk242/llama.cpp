@@ -4820,6 +4820,45 @@ struct test_inkling_mix : public test_case {
     }
 };
 
+// Inkling 2 convolve() as in src/models/inkling2.cpp (without input-dependent taps): causal short convolution with
+// a residual, (cur + ssm_conv(concat(past, cur^T)))*scale. The Vulkan backend fuses the add and scale (SSM_CONV_RES_SCALE).
+struct test_inkling_convolve : public test_case {
+    const int64_t n_channels;
+    const int64_t n_conv;
+    const int64_t n_tokens;
+    const int64_t n_seqs;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "INKLING_CONVOLVE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR4(n_channels, n_conv, n_tokens, n_seqs);
+    }
+
+    test_inkling_convolve(int64_t n_channels = 2304, int64_t n_conv = 4, int64_t n_tokens = 1, int64_t n_seqs = 1)
+        : n_channels(n_channels), n_conv(n_conv), n_tokens(n_tokens), n_seqs(n_seqs) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t n_seq_tokens = n_tokens / n_seqs;
+        ggml_tensor * cur    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_channels, n_tokens);
+        ggml_tensor * past   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_conv - 1, n_channels, n_seqs);
+        ggml_tensor * weight = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_conv, n_channels);
+
+        ggml_tensor * x = ggml_transpose(ctx, ggml_reshape_3d(ctx, cur, n_channels, n_seq_tokens, n_seqs));
+        x = ggml_concat(ctx, past, x, 0);
+
+        ggml_tensor * out = ggml_ssm_conv(ctx, x, weight);
+        out = ggml_reshape_2d(ctx, out, n_channels, n_tokens);
+        out = ggml_scale(ctx, ggml_add(ctx, cur, out), 1.0f/sqrtf(n_conv + 1));
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // SNAKE activation fusion: y = x + sin(a*x)^2 * inv_b
 // CUDA backend matches the naive 5-op chain (mul, sin, sqr, mul, add)
 // and dispatches a single fused kernel.
@@ -14266,6 +14305,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
     test_cases.emplace_back(new test_inkling_mix(100, 3, 2, 3));   // fewer channels than threads
+    for (int64_t n_tokens : { 1, 2, 7, 512 }) {
+        test_cases.emplace_back(new test_inkling_convolve(2304, 4, n_tokens, 1));
+        test_cases.emplace_back(new test_inkling_convolve(1024, 4, n_tokens, 1));
+    }
+    test_cases.emplace_back(new test_inkling_convolve(100, 3, 5, 1));
+    test_cases.emplace_back(new test_inkling_convolve(1024, 4, 6, 2));  // two sequences: not fused
     test_cases.emplace_back(new test_inkling_mix(4096, 3, 2, 3));  // the most channels the fusion takes
     test_cases.emplace_back(new test_inkling_mix(4100, 3, 2, 3));  // too many: not fused
     test_cases.emplace_back(new test_inkling_mix(2302, 3, 2, 3));  // not a multiple of 4: not fused
