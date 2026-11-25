@@ -4859,6 +4859,51 @@ struct test_inkling_convolve : public test_case {
     }
 };
 
+// SITU activation of the Inkling 2 experts as in llm_graph_context::build_moe_ffn (LLM_FFN_SITU) on the gate and up views
+// of a merged gate_up: beta*tanh(gate/beta)*sigmoid(gate) * lb*tanh(up/lb). The Vulkan backend fuses it (SITU).
+struct test_situ : public test_case {
+    const int64_t n_ff;
+    const int64_t n_used;
+    const int64_t n_tokens;
+    const float beta;
+    const float lb;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SITU";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR5(n_ff, n_used, n_tokens, beta, lb);
+    }
+
+    test_situ(int64_t n_ff = 1152, int64_t n_used = 8, int64_t n_tokens = 1, float beta = 4.0f, float lb = 8.0f)
+        : n_ff(n_ff), n_used(n_used), n_tokens(n_tokens), beta(beta), lb(lb) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * gate_up = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2*n_ff, n_used, n_tokens);
+        gate_up = ggml_scale(ctx, gate_up, 1.0f); // computed, as the mul_mat_id output in the model
+
+        ggml_tensor * cur = ggml_view_3d(ctx, gate_up, n_ff, gate_up->ne[1], gate_up->ne[2], gate_up->nb[1], gate_up->nb[2], 0);
+        ggml_tensor * up  = ggml_view_3d(ctx, gate_up, n_ff, gate_up->ne[1], gate_up->ne[2], gate_up->nb[1], gate_up->nb[2], n_ff * gate_up->nb[0]);
+
+        ggml_tensor * act = ggml_scale(ctx, ggml_tanh(ctx, ggml_scale(ctx, cur, 1.0f/beta)), beta);
+        act = ggml_mul(ctx, act, ggml_sigmoid(ctx, cur));
+        up  = ggml_scale(ctx, ggml_tanh(ctx, ggml_scale(ctx, up, 1.0f/lb)), lb);
+        ggml_tensor * out = ggml_mul(ctx, act, up);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -20.0f, 20.0f);
+        }
+    }
+};
+
 // SNAKE activation fusion: y = x + sin(a*x)^2 * inv_b
 // CUDA backend matches the naive 5-op chain (mul, sin, sqr, mul, add)
 // and dispatches a single fused kernel.
@@ -14310,6 +14355,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_inkling_convolve(1024, 4, n_tokens, 1));
     }
     test_cases.emplace_back(new test_inkling_convolve(100, 3, 5, 1));
+    for (int64_t n_tokens : { 1, 3, 512 }) {
+        test_cases.emplace_back(new test_situ(1152, 8, n_tokens));
+    }
+    test_cases.emplace_back(new test_situ(100, 3, 70, 2.0f, 0.5f));
     test_cases.emplace_back(new test_inkling_convolve(1024, 4, 6, 2));  // two sequences: not fused
     test_cases.emplace_back(new test_inkling_mix(4096, 3, 2, 3));  // the most channels the fusion takes
     test_cases.emplace_back(new test_inkling_mix(4100, 3, 2, 3));  // too many: not fused

@@ -1,0 +1,45 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+
+// The SITU activation of the Inkling 2 experts, fused from its 9 elementwise ops:
+//   dst = (s1*tanh(s0*g + b0) + b1) * sigmoid(g) * (s3*tanh(s2*u + b2) + b3)
+// with the scales and biases of the four SCALE ops (beta, linear beta). g and u are views of the gate_up output.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer G { float data_g[]; };
+layout(binding = 1) readonly buffer U { float data_u[]; };
+layout(binding = 2) writeonly buffer D { float data_d[]; };
+
+layout(push_constant) uniform parameter {
+    uint ne0; uint ne1; uint ne2;
+    uint g_off; uint g_nb1; uint g_nb2;
+    uint u_off; uint u_nb1; uint u_nb2;
+    uint d_off; uint d_nb1; uint d_nb2;
+    float s0; float b0; float s1; float b1;
+    float s2; float b2; float s3; float b3;
+};
+
+// as op_tanh / op_sigmoid in unary.comp
+float tanh_f(const float x) {
+    return 1.0f - 2.0f / (exp(2.0f*x) + 1.0f);
+}
+
+void main() {
+    const uint idx = (gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x) * 256 + gl_LocalInvocationID.x;
+    if (idx >= ne0 * ne1 * ne2) {
+        return;
+    }
+    const uint i0 = idx % ne0;
+    const uint i1 = (idx / ne0) % ne1;
+    const uint i2 = idx / (ne0 * ne1);
+
+    const float g = data_g[g_off + i0 + i1 * g_nb1 + i2 * g_nb2];
+    const float u = data_u[u_off + i0 + i1 * u_nb1 + i2 * u_nb2];
+
+    const float act = (tanh_f(g * s0 + b0) * s1 + b1) * (1.0f / (1.0f + exp(-g)));
+    const float up  = tanh_f(u * s2 + b2) * s3 + b3;
+
+    data_d[d_off + i0 + i1 * d_nb1 + i2 * d_nb2] = act * up;
+}

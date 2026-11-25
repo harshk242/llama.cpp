@@ -244,6 +244,15 @@ struct vk_op_depth_mix_push_constants {
     float scale;
 };
 
+struct vk_op_situ_push_constants {
+    uint32_t ne0; uint32_t ne1; uint32_t ne2;
+    uint32_t g_off; uint32_t g_nb1; uint32_t g_nb2;
+    uint32_t u_off; uint32_t u_nb1; uint32_t u_nb2;
+    uint32_t d_off; uint32_t d_nb1; uint32_t d_nb2;
+    float s0; float b0; float s1; float b1;
+    float s2; float b2; float s3; float b3;
+};
+
 struct vk_op_ctrl_gate_push_constants {
     uint32_t nrows;
     uint32_t k4;
