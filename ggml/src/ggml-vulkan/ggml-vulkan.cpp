@@ -4120,6 +4120,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         ggml_vk_create_pipeline(device, device->pipeline_ctrl_gate_f16, "ctrl_gate_f16", ctrl_gate_f16_len, ctrl_gate_f16_data, "main", 6, sizeof(vk_op_ctrl_gate_push_constants), {1, 1, 1}, { 128, 32 }, 1, true, true, required);
         ggml_vk_create_pipeline(device, device->pipeline_clip_f32, "clip_f32", clip_f32_len, clip_f32_data, "main", 4, sizeof(vk_op_clip_push_constants), {1, 1, 1}, { 128 }, 1, true, true, required);
         device->ctrl_gate_subgroup_size = sg;
+        ggml_vk_create_pipeline(device, device->pipeline_ctrl_gate_tile_f32, "ctrl_gate_tile_f32", ctrl_gate_tile_f32_len, ctrl_gate_tile_f32_data, "main", 6, sizeof(vk_op_ctrl_gate_push_constants), {1, 1, 1}, {}, 1, true);
+        ggml_vk_create_pipeline(device, device->pipeline_ctrl_gate_tile_f16, "ctrl_gate_tile_f16", ctrl_gate_tile_f16_len, ctrl_gate_tile_f16_data, "main", 6, sizeof(vk_op_ctrl_gate_push_constants), {1, 1, 1}, {}, 1, true);
     }
     ggml_vk_create_pipeline(device, device->pipeline_short_conv_f32, "short_conv_f32", short_conv_f32_len, short_conv_f32_data, "main", 6, sizeof(vk_op_short_conv_push_constants), {1, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_situ_f32, "situ_f32", situ_f32_len, situ_f32_data, "main", 3, sizeof(vk_op_situ_push_constants), {1, 1, 1}, {}, 1);
@@ -8352,7 +8354,12 @@ void ggml_vk_ctrl_gate(ggml_backend_vk_context * ctx, vk_context& subctx, const 
     const ggml_tensor * cur  = mul->src[1];
     const ggml_tensor * msg  = mulm->src[1];
 
-    vk_pipeline pipeline = wf->type == GGML_TYPE_F16 ? ctx->device->pipeline_ctrl_gate_f16 : ctx->device->pipeline_ctrl_gate_f32;
+    // many tokens: one thread per row over a token tile (ctrl_gate_tile.comp), else one subgroup per row
+    static const uint32_t tile_min = getenv("GGML_VK_CTRL_GATE_TILE_MIN") ? (uint32_t) atoi(getenv("GGML_VK_CTRL_GATE_TILE_MIN")) : 16;
+    const bool tile = (uint32_t) dst->ne[1] >= tile_min;
+    vk_pipeline pipeline = tile ?
+        (wf->type == GGML_TYPE_F16 ? ctx->device->pipeline_ctrl_gate_tile_f16 : ctx->device->pipeline_ctrl_gate_tile_f32) :
+        (wf->type == GGML_TYPE_F16 ? ctx->device->pipeline_ctrl_gate_f16 : ctx->device->pipeline_ctrl_gate_f32);
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
 
     const uint32_t wts = ggml_type_size(wf->type);
@@ -8369,8 +8376,8 @@ void ggml_vk_ctrl_gate(ggml_backend_vk_context * ctx, vk_context& subctx, const 
         get_misalign_bytes(ctx, dst) / 4, (uint32_t) (dst->nb[1] / 4),
     };
 
-    const uint32_t rows_per_wg = 128 / ctx->device->ctrl_gate_subgroup_size;
-    const uint32_t tokens_per_wg = 32;
+    const uint32_t rows_per_wg = tile ? 128 : 128 / ctx->device->ctrl_gate_subgroup_size;
+    const uint32_t tokens_per_wg = tile ? 16 : 32;
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
         { ggml_vk_tensor_subbuffer(ctx, wf, true), ggml_vk_tensor_subbuffer(ctx, wg, true), ggml_vk_tensor_subbuffer(ctx, gate, true),
           ggml_vk_tensor_subbuffer(ctx, cur, true), ggml_vk_tensor_subbuffer(ctx, msg, true), ggml_vk_tensor_subbuffer(ctx, dst, true) },
@@ -15358,7 +15365,7 @@ static bool ggml_vk_can_fuse_ctrl_gate(const ggml_backend_vk_context * ctx, cons
     }
     // 2d only, no broadcast; the shader keeps a weight row in at most 4 vec4 per lane
     const int64_t k = gate->ne[0];
-    if (k % 4 != 0 || k > 16 * (int64_t) ctx->device->ctrl_gate_subgroup_size ||
+    if (k % 4 != 0 || k > 16 * (int64_t) ctx->device->ctrl_gate_subgroup_size || k > 256 || // MAX_K of ctrl_gate_tile.comp
         wf->ne[0] != k || wg->ne[0] != k || wf->ne[1] != dst->ne[0] || wg->ne[1] != dst->ne[0] ||
         gate->ne[1] != dst->ne[1] || !ggml_are_same_shape(cur, dst) || !ggml_are_same_shape(msg, dst) ||
         ggml_nrows(dst) != dst->ne[1] || ggml_nrows(gate) != gate->ne[1] ||

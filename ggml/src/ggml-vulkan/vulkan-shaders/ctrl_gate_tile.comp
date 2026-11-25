@@ -1,0 +1,98 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+#if defined(DATA_W_F16)
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#endif
+
+// The fused Inkling 2 loop control of ctrl_gate.comp for many tokens:
+//   dst = (cur - tanh(w_forget*gate)*cur) + tanh(w_gain*gate)*msg
+// One thread per output row and a tile of TOKENS tokens per workgroup: the gate rows of the tile are staged in
+// shared memory, each thread streams its two weight rows once and keeps TOKENS sums of each, so cur, msg and dst
+// are read and written contiguously across the threads of the workgroup.
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+#define TOKENS 16
+#define MAX_K 256
+
+#if defined(DATA_W_F16)
+#define W_TYPE float16_t
+#else
+#define W_TYPE float
+#endif
+
+layout(binding = 0) readonly buffer WF { W_TYPE data_wf[]; };
+layout(binding = 1) readonly buffer WG { W_TYPE data_wg[]; };
+layout(binding = 2) readonly buffer G  { float data_g[]; };
+layout(binding = 3) readonly buffer C  { float data_c[]; };
+layout(binding = 4) readonly buffer M  { float data_m[]; };
+layout(binding = 5) writeonly buffer D { float data_d[]; };
+
+// strides in elements of the buffer types (the vec4 strides of ctrl_gate.comp times 4)
+layout(push_constant) uniform parameter {
+    uint nrows;
+    uint k4;
+    uint ntok;
+    uint wf_off4; uint wf_stride4;
+    uint wg_off4; uint wg_stride4;
+    uint g_off4;  uint g_stride4;
+    uint c_off;   uint c_stride;
+    uint m_off;   uint m_stride;
+    uint d_off;   uint d_stride;
+};
+
+// [k][token], read as vec4 over the tokens
+shared vec4 gate_s[MAX_K][TOKENS / 4];
+
+float tanh_f(const float x) {
+    return 1.0f - 2.0f / (exp(2.0f*x) + 1.0f);
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint row = gl_WorkGroupID.x * 128 + tid;
+    const uint t0  = gl_WorkGroupID.y * TOKENS;
+    const uint nt  = min(TOKENS, ntok - t0);
+    const uint k   = 4 * k4;
+
+    for (uint i = tid; i < TOKENS * k; i += 128) {
+        const uint t = i / k;
+        const uint j = i % k;
+        gate_s[j][t / 4][t % 4] = t < nt ? data_g[4 * g_off4 + (t0 + t) * 4 * g_stride4 + j] : 0.0f;
+    }
+    barrier();
+
+    if (row >= nrows) {
+        return;
+    }
+
+    vec4 sf[TOKENS / 4];
+    vec4 sg[TOKENS / 4];
+    [[unroll]] for (uint t = 0; t < TOKENS / 4; ++t) {
+        sf[t] = vec4(0.0f);
+        sg[t] = vec4(0.0f);
+    }
+
+    const uint wf_base = 4 * (wf_off4 + row * wf_stride4);
+    const uint wg_base = 4 * (wg_off4 + row * wg_stride4);
+    for (uint j = 0; j < k; ++j) {
+        const float wf = float(data_wf[wf_base + j]);
+        const float wg = float(data_wg[wg_base + j]);
+        [[unroll]] for (uint t = 0; t < TOKENS / 4; ++t) {
+            const vec4 g = gate_s[j][t];
+            sf[t] += wf * g;
+            sg[t] += wg * g;
+        }
+    }
+
+    [[unroll]] for (uint t = 0; t < TOKENS; ++t) {
+        if (t < nt) {
+            const uint tt = t0 + t;
+            const float cv = data_c[c_off + tt * c_stride + row];
+            const float mv = data_m[m_off + tt * m_stride + row];
+            data_d[d_off + tt * d_stride + row] = (cv - tanh_f(sf[t / 4][t % 4]) * cv) + tanh_f(sg[t / 4][t % 4]) * mv;
+        }
+    }
+}

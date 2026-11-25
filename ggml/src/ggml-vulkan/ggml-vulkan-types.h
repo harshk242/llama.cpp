@@ -1074,6 +1074,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_dsv4_hc_post_nocomb_f32;
     vk_pipeline pipeline_ctrl_gate_f32;
     vk_pipeline pipeline_ctrl_gate_f16;
+    vk_pipeline pipeline_ctrl_gate_tile_f32;
+    vk_pipeline pipeline_ctrl_gate_tile_f16;
     vk_pipeline pipeline_depth_mix_f32;
     vk_pipeline pipeline_situ_f32;
     vk_pipeline pipeline_clip_f32;

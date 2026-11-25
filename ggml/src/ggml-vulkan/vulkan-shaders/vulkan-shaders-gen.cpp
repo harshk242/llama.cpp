@@ -1095,6 +1095,8 @@ void process_shaders() {
     string_to_spv("dsv4_hc_post_f32", "dsv4_hc_post.comp", {});
     string_to_spv("ctrl_gate_f32", "ctrl_gate.comp", {});
     string_to_spv("ctrl_gate_f16", "ctrl_gate.comp", {{"DATA_W_F16", "1"}});
+    string_to_spv("ctrl_gate_tile_f32", "ctrl_gate_tile.comp", {});
+    string_to_spv("ctrl_gate_tile_f16", "ctrl_gate_tile.comp", {{"DATA_W_F16", "1"}});
     string_to_spv("depth_mix_f32", "depth_mix.comp", {});
     string_to_spv("situ_f32", "situ.comp", {});
     string_to_spv("clip_f32", "clip.comp", {});
