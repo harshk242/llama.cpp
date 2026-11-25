@@ -4766,6 +4766,60 @@ struct test_inkling_control : public test_case {
     }
 };
 
+// Inkling 2 mix() as in src/models/inkling2.cpp: soft_max over the (normalized) states of their scores with learned
+// queries, then the weighted sum of the states. The Vulkan backend fuses it into one shader (DEPTH_MIX).
+struct test_inkling_mix : public test_case {
+    const int64_t n_embd;
+    const int64_t na;       // states of the earlier blocks
+    const int64_t nq;       // queries
+    const int64_t n_tokens;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "INKLING_MIX";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override {
+        // the unfused Vulkan path is at ~1e-7 for long rows
+        return 5e-7;
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR4(n_embd, na, nq, n_tokens);
+    }
+
+    test_inkling_mix(int64_t n_embd = 2304, int64_t na = 2, int64_t nq = 1, int64_t n_tokens = 1)
+        : n_embd(n_embd), na(na), nq(nq), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * blocks = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, na, n_tokens);
+        ggml_tensor * cur    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, 1, n_tokens);
+        ggml_tensor * query  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, nq);
+        ggml_set_name(query, "query");
+
+        ggml_tensor * states = ggml_concat(ctx, ggml_rms_norm(ctx, blocks, 1e-6f), ggml_rms_norm(ctx, cur, 1e-6f), 1);
+
+        ggml_tensor * queries = n_tokens == 1 ? query :
+            ggml_repeat(ctx, query, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, nq, n_tokens));
+
+        ggml_tensor * scores = ggml_mul_mat(ctx, states, queries);
+        scores = ggml_soft_max_ext(ctx, scores, nullptr, 1.0f/sqrtf(n_embd), 0.0f);
+
+        ggml_tensor * out = ggml_mul_mat(ctx, scores, ggml_cont(ctx, ggml_transpose(ctx, states)));
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            // queries of the model's scale: the scores spread over a few units
+            init_tensor_uniform(t, std::string(ggml_get_name(t)) == "query" ? -0.2f : -1.0f, std::string(ggml_get_name(t)) == "query" ? 0.2f : 1.0f);
+        }
+    }
+};
+
 // SNAKE activation fusion: y = x + sin(a*x)^2 * inv_b
 // CUDA backend matches the naive 5-op chain (mul, sin, sqr, mul, add)
 // and dispatches a single fused kernel.
@@ -14206,6 +14260,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    for (int64_t n_tokens : { 1, 2, 7, 512 }) {
+        for (auto [na, nq] : std::vector<std::pair<int64_t, int64_t>>{ {1, 1}, {2, 3}, {4, 1}, {1, 4}, {7, 4} }) {
+            test_cases.emplace_back(new test_inkling_mix(2304, na, nq, n_tokens));
+        }
+    }
+    test_cases.emplace_back(new test_inkling_mix(100, 3, 2, 3));   // fewer channels than threads
+    test_cases.emplace_back(new test_inkling_mix(4096, 3, 2, 3));  // the most channels the fusion takes
+    test_cases.emplace_back(new test_inkling_mix(4100, 3, 2, 3));  // too many: not fused
+    test_cases.emplace_back(new test_inkling_mix(2302, 3, 2, 3));  // not a multiple of 4: not fused
+    test_cases.emplace_back(new test_inkling_mix(2304, 8, 1, 2));  // 9 states: not fused
+    test_cases.emplace_back(new test_inkling_mix(2304, 2, 5, 2));  // 5 queries: not fused
     for (ggml_type wtype : { GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_BF16 }) {
         for (int64_t n_tokens : { 1, 2, 7, 33, 512 }) {
             test_cases.emplace_back(new test_inkling_control(wtype, 2304, 64, n_tokens));
@@ -14558,6 +14623,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // the Inkling loop control at the model shape, decode and prefill
     test_cases.emplace_back(new test_inkling_control(GGML_TYPE_F16, 2304, 64, 1));
     test_cases.emplace_back(new test_inkling_control(GGML_TYPE_F16, 2304, 64, 1024));
+    test_cases.emplace_back(new test_inkling_mix(2304, 4, 3, 1));
+    test_cases.emplace_back(new test_inkling_mix(2304, 4, 3, 1024));
     test_cases.emplace_back(new test_snake_fuse(GGML_TYPE_F32,  {7680, 192, 1, 1}));
     test_cases.emplace_back(new test_snake_fuse(GGML_TYPE_F16,  {7680, 192, 1, 1}));
     test_cases.emplace_back(new test_snake_fuse(GGML_TYPE_BF16, {7680, 192, 1, 1}));

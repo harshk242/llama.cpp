@@ -617,6 +617,33 @@ static constexpr std::initializer_list<std::array<int, 3>> ctrl_gate_edges {
     { 7, 1, 6 }, // add->src[1]  == mul
 };
 
+// Inkling 2 mix(): soft_max(states*query) weighted sum of the states, states = concat(a, b, 1)
+static constexpr std::initializer_list<ggml_op> depth_mix_pattern { GGML_OP_CONCAT, GGML_OP_MUL_MAT, GGML_OP_SOFT_MAX,
+                                                                    GGML_OP_TRANSPOSE, GGML_OP_CONT, GGML_OP_MUL_MAT };
+
+static constexpr std::initializer_list<std::array<int, 3>> depth_mix_edges {
+    { 1, 0, 0 }, // mul_mat->src[0]   == concat
+    { 2, 0, 1 }, // soft_max->src[0]  == mul_mat
+    { 3, 0, 0 }, // transpose->src[0] == concat
+    { 4, 0, 3 }, // cont->src[0]      == transpose
+    { 5, 0, 2 }, // mul_mat->src[0]   == soft_max
+    { 5, 1, 4 }, // mul_mat->src[1]   == cont
+};
+
+// the same with the queries repeated over the tokens
+static constexpr std::initializer_list<ggml_op> depth_mix_repeat_pattern { GGML_OP_CONCAT, GGML_OP_REPEAT, GGML_OP_MUL_MAT, GGML_OP_SOFT_MAX,
+                                                                           GGML_OP_TRANSPOSE, GGML_OP_CONT, GGML_OP_MUL_MAT };
+
+static constexpr std::initializer_list<std::array<int, 3>> depth_mix_repeat_edges {
+    { 2, 0, 0 }, // mul_mat->src[0]   == concat
+    { 2, 1, 1 }, // mul_mat->src[1]   == repeat
+    { 3, 0, 2 }, // soft_max->src[0]  == mul_mat
+    { 4, 0, 0 }, // transpose->src[0] == concat
+    { 5, 0, 4 }, // cont->src[0]      == transpose
+    { 6, 0, 3 }, // mul_mat->src[0]   == soft_max
+    { 6, 1, 5 }, // mul_mat->src[1]   == cont
+};
+
 static constexpr std::initializer_list<std::array<int, 3>> topk_moe_early_softmax_norm_edges {
     { 1, 0, 0 }, // reshape->src[0]  == softmax
     { 2, 0, 0 }, // argsort->src[0]  == softmax
@@ -1020,6 +1047,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_dsv4_hc_post_nocomb_f32;
     vk_pipeline pipeline_ctrl_gate_f32;
     vk_pipeline pipeline_ctrl_gate_f16;
+    vk_pipeline pipeline_depth_mix_f32;
     uint32_t ctrl_gate_subgroup_size {};
     vk_pipeline pipeline_top_k_mask_f16;
     vk_pipeline pipeline_top_k_mask_f32;
@@ -1398,6 +1426,7 @@ struct ggml_backend_vk_context {
     bool fused_topk_qsa {};
     bool fused_hc_post_gate {};
     bool fused_ctrl_gate {};
+    bool fused_depth_mix {};
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};
     // soft_max followed by a cast to f16
     bool fused_soft_max_f16 {};

@@ -4120,6 +4120,9 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         ggml_vk_create_pipeline(device, device->pipeline_ctrl_gate_f16, "ctrl_gate_f16", ctrl_gate_f16_len, ctrl_gate_f16_data, "main", 6, sizeof(vk_op_ctrl_gate_push_constants), {1, 1, 1}, { 128, 32 }, 1, true, true, required);
         device->ctrl_gate_subgroup_size = sg;
     }
+    if (device->subgroup_arithmetic && device->subgroup_size >= 8 && device->properties.limits.maxComputeWorkGroupInvocations >= 1024) {
+        ggml_vk_create_pipeline(device, device->pipeline_depth_mix_f32, "depth_mix_f32", depth_mix_f32_len, depth_mix_f32_data, "main", 4, sizeof(vk_op_depth_mix_push_constants), {1, 1, 1}, { 1024 }, 1, true, device->subgroup_require_full_support);
+    }
 
     const uint32_t top_k_mask_wg = std::min({256u, device->properties.limits.maxComputeWorkGroupInvocations, device->properties.limits.maxComputeWorkGroupSize[0]});
     ggml_vk_create_pipeline(device, device->pipeline_top_k_mask_f16, "top_k_mask_f16", top_k_mask_f16_len, top_k_mask_f16_data, "main", 6, sizeof(vk_op_top_k_mask_push_constants), {1, 1, 1}, {top_k_mask_wg}, 1);
@@ -8164,6 +8167,35 @@ void ggml_vk_dsv4_hc_pre(ggml_backend_vk_context * ctx, vk_context& subctx, cons
     init_pushconst_tensor_offsets(ctx, pc, x, weights, nullptr, nullptr, dst);
 
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { x_buf, w_buf, d_buf }, pc, { n_embd, n_tokens, 1 });
+}
+
+// nodes: the depth_mix_pattern or depth_mix_repeat_pattern subgraph, see ggml_vk_can_fuse_depth_mix
+void ggml_vk_depth_mix(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_cgraph * cgraph, int node_idx, int n_fused) {
+    const ggml_tensor * concat = cgraph->nodes[node_idx];
+    const ggml_tensor * scores = cgraph->nodes[node_idx + (n_fused == 7 ? 2 : 1)];
+    const ggml_tensor * sm     = cgraph->nodes[node_idx + (n_fused == 7 ? 3 : 2)];
+    ggml_tensor       * dst    = cgraph->nodes[node_idx + n_fused - 1];
+
+    const ggml_tensor * a = concat->src[0];
+    const ggml_tensor * b = concat->src[1];
+    const ggml_tensor * q = n_fused == 7 ? scores->src[1]->src[0] : scores->src[1];
+
+    vk_pipeline pipeline = ctx->device->pipeline_depth_mix_f32;
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    vk_op_depth_mix_push_constants pc = {
+        (uint32_t) a->ne[0], (uint32_t) a->ne[1], (uint32_t) b->ne[1], (uint32_t) q->ne[1],
+        get_misalign_bytes(ctx, a) / 16, (uint32_t) (a->nb[1] / 16), (uint32_t) (a->nb[2] / 16),
+        get_misalign_bytes(ctx, b) / 16, (uint32_t) (b->nb[1] / 16), (uint32_t) (b->nb[2] / 16),
+        get_misalign_bytes(ctx, q) / 16, (uint32_t) (q->nb[1] / 16), q->ne[2] == 1 ? 0u : (uint32_t) (q->nb[2] / 16),
+        get_misalign_bytes(ctx, dst) / 4, (uint32_t) (dst->nb[1] / 4), (uint32_t) (dst->nb[2] / 4),
+        ggml_get_op_params_f32(sm, 0),
+    };
+
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        { ggml_vk_tensor_subbuffer(ctx, a, true), ggml_vk_tensor_subbuffer(ctx, b, true), ggml_vk_tensor_subbuffer(ctx, q, true),
+          ggml_vk_tensor_subbuffer(ctx, dst, true) },
+        pc, { (uint32_t) dst->ne[2], 1, 1 });
 }
 
 // nodes: the ctrl_gate_pattern subgraph, see ggml_vk_can_fuse_ctrl_gate
@@ -13746,7 +13778,11 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
 
         break;
     case GGML_OP_CONCAT:
-        ggml_vk_concat(ctx, compute_ctx, src0, src1, node);
+        if (ctx->fused_depth_mix) {
+            ggml_vk_depth_mix(ctx, compute_ctx, cgraph, node_idx, ctx->num_additional_fused_ops + 1);
+        } else {
+            ggml_vk_concat(ctx, compute_ctx, src0, src1, node);
+        }
 
         break;
     case GGML_OP_UPSCALE:
@@ -14908,6 +14944,56 @@ static bool ggml_vk_can_fuse_unary_mul_pair(const struct ggml_cgraph * cgraph, i
            ggml_vk_can_fuse_unary_mul(cgraph, node_idx, node_idx + 1);
 }
 
+// returns the number of fused nodes (6 or 7 with a repeat of the queries), 0 if not
+static int ggml_vk_can_fuse_depth_mix(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    if (!ctx->device->pipeline_depth_mix_f32) {
+        return 0;
+    }
+    int n = 0;
+    if (ggml_can_fuse_subgraph(cgraph, node_idx, depth_mix_pattern, { node_idx + 5 }) &&
+        ggml_check_edges(cgraph, node_idx, depth_mix_edges)) {
+        n = 6;
+    } else if (ggml_can_fuse_subgraph(cgraph, node_idx, depth_mix_repeat_pattern, { node_idx + 6 }) &&
+               ggml_check_edges(cgraph, node_idx, depth_mix_repeat_edges)) {
+        n = 7;
+    } else {
+        return 0;
+    }
+    const ggml_tensor * concat = cgraph->nodes[node_idx];
+    const ggml_tensor * scores = cgraph->nodes[node_idx + n - 5];
+    const ggml_tensor * sm     = cgraph->nodes[node_idx + n - 4];
+    const ggml_tensor * dst    = cgraph->nodes[node_idx + n - 1];
+    const ggml_tensor * a = concat->src[0];
+    const ggml_tensor * b = concat->src[1];
+    const ggml_tensor * q = n == 7 ? scores->src[1]->src[0] : scores->src[1];
+
+    const int64_t n_embd = concat->ne[0];
+    const int64_t ns     = concat->ne[1];
+    const int64_t n_tok  = concat->ne[2];
+    if (ggml_get_op_params_i32(concat, 0) != 1 || concat->type != GGML_TYPE_F32 || a->type != GGML_TYPE_F32 ||
+        b->type != GGML_TYPE_F32 || q->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || scores->type != GGML_TYPE_F32 ||
+        concat->ne[3] != 1 || ns > 8 || q->ne[0] != n_embd || q->ne[1] > 4 || q->ne[3] != 1 ||
+        (q->ne[2] != 1 && q->ne[2] != n_tok) || (n == 6 && q->ne[2] != n_tok) ||
+        a->nb[0] != 4 || b->nb[0] != 4 || q->nb[0] != 4 || n_embd % 4 != 0 || n_embd > 4 * 1024) {
+        return 0;
+    }
+    // vec4 loads of a, b and q
+    for (const ggml_tensor * t : { a, b, q }) {
+        if (get_misalign_bytes(ctx, t) % 16 || t->nb[1] % 16 || t->nb[2] % 16) {
+            return 0;
+        }
+    }
+    // soft_max without mask, sinks or alibi
+    if (sm->src[1] || sm->src[2] || ggml_get_op_params_f32(sm, 1) != 0.0f) {
+        return 0;
+    }
+    // dst = [nq, n_embd, T]
+    if (dst->ne[0] != q->ne[1] || dst->ne[1] != n_embd || dst->ne[2] != n_tok || dst->ne[3] != 1 || dst->nb[0] != 4) {
+        return 0;
+    }
+    return n;
+}
+
 static bool ggml_vk_can_fuse_ctrl_gate(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
     if (ctx->device->ctrl_gate_subgroup_size == 0 ||
         !ggml_can_fuse_subgraph(cgraph, node_idx, ctrl_gate_pattern, { node_idx + 7 }) ||
@@ -15870,12 +15956,19 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_topk_qsa = false;
         ctx->fused_hc_post_gate = false;
         ctx->fused_ctrl_gate = false;
+        ctx->fused_depth_mix = false;
         ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
         ctx->fused_soft_max_f16 = false;
         const char *fusion_string {};
         if (!ctx->device->disable_fusion) {
             uint32_t num_adds = ggml_vk_fuse_multi_add(ctx, cgraph, i);
-            if (cgraph->nodes[i]->op == GGML_OP_MUL_MAT && ggml_vk_can_fuse_ctrl_gate(ctx, cgraph, i)) {
+            int n_mix = 0;
+            if (cgraph->nodes[i]->op == GGML_OP_CONCAT && (n_mix = ggml_vk_can_fuse_depth_mix(ctx, cgraph, i)) != 0) {
+                ctx->num_additional_fused_ops = n_mix - 1;
+                ctx->fused_depth_mix = true;
+                fusion_string = "DEPTH_MIX";
+                std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
+            } else if (cgraph->nodes[i]->op == GGML_OP_MUL_MAT && ggml_vk_can_fuse_ctrl_gate(ctx, cgraph, i)) {
                 ctx->num_additional_fused_ops = ctrl_gate_pattern.size() - 1;
                 ctx->fused_ctrl_gate = true;
                 fusion_string = "CTRL_GATE";
@@ -16137,6 +16230,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_topk_qsa = false;
                 ctx->fused_hc_post_gate = false;
                 ctx->fused_ctrl_gate = false;
+                ctx->fused_depth_mix = false;
                 ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
                 ctx->fused_soft_max_f16 = false;
                 fusion_string = nullptr;
@@ -16414,7 +16508,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
         }
         // the Inkling patterns have independent branches (the gain mat-vec), keep every node in place
         bool kept_inkling = false;
-        for (const auto & pattern : { ctrl_gate_pattern }) {
+        for (const auto & pattern : { ctrl_gate_pattern, depth_mix_pattern, depth_mix_repeat_pattern }) {
             if (match_pattern(pattern, first_unused)) {
                 add_pattern_alloc_deps(pattern, first_unused + (int) pattern.size() - 1);
                 keep_pattern(pattern);
@@ -16454,7 +16548,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 return false;
             };
             auto const &in_inkling_pattern = [&](int n) -> bool {
-                for (const auto & pattern : { ctrl_gate_pattern }) {
+                for (const auto & pattern : { ctrl_gate_pattern, depth_mix_pattern, depth_mix_repeat_pattern }) {
                     for (int o = 0; o < (int) pattern.size(); ++o) {
                         if (n - o >= 0 && match_pattern(pattern, n - o)) {
                             return true;

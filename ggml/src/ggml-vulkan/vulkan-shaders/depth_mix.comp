@@ -1,0 +1,116 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// Attention over the depth (mix() of Inkling 2), fused from
+//   states = concat(a, b, 1)                                   [n_embd, ns, T], ns = na + nb
+//   p      = soft_max(scale * mul_mat(states, query))          [ns, nq, T]
+//   dst    = mul_mat(p, cont(transpose(states)))               [nq, n_embd, T]
+// One workgroup per token: thread i holds channels 4i..4i+3 of every state in registers (n_embd <= 4*workgroup size),
+// so the states are read once with all loads in flight; the ns x nq scores are reduced over the workgroup, then the
+// same threads write the weighted sums of their channels.
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+#define MAX_S 8
+#define MAX_Q 4
+#define MAX_SUBGROUPS 128
+
+layout(binding = 0) readonly buffer A { vec4 data_a[]; };
+layout(binding = 1) readonly buffer B { vec4 data_b[]; };
+layout(binding = 2) readonly buffer Q { vec4 data_q[]; };
+layout(binding = 3) writeonly buffer D { float data_d[]; };
+
+// offsets and strides of a, b and q in vec4, of d in floats
+layout(push_constant) uniform parameter {
+    uint n_embd;
+    uint na;
+    uint nb;
+    uint nq;
+    uint a_off; uint a_nb1; uint a_nb2;
+    uint b_off; uint b_nb1; uint b_nb2;
+    uint q_off; uint q_nb1; uint q_nb2;   // q_nb2 = 0: one query set for every token
+    uint d_off; uint d_nb1; uint d_nb2;   // dst[q + e*d_nb1 + t*d_nb2]
+    float scale;
+};
+
+shared float partial[MAX_SUBGROUPS][MAX_S * MAX_Q];
+shared float probs[MAX_S * MAX_Q];
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint t   = gl_WorkGroupID.x;
+    const uint ns  = na + nb;
+    const bool in_range = 4 * tid < n_embd;
+
+    vec4 x[MAX_S];
+    [[unroll]] for (uint s = 0; s < MAX_S; ++s) {
+        x[s] = vec4(0.0f);
+        if (in_range && s < ns) {
+            x[s] = s < na ? data_a[a_off + tid + s * a_nb1 + t * a_nb2] : data_b[b_off + tid + (s - na) * b_nb1 + t * b_nb2];
+        }
+    }
+    vec4 qv[MAX_Q];
+    [[unroll]] for (uint q = 0; q < MAX_Q; ++q) {
+        qv[q] = in_range && q < nq ? data_q[q_off + tid + q * q_nb1 + t * q_nb2] : vec4(0.0f);
+    }
+
+    [[unroll]] for (uint s = 0; s < MAX_S; ++s) {
+        [[unroll]] for (uint q = 0; q < MAX_Q; ++q) {
+            if (s < ns && q < nq) {
+                const float v = subgroupAdd(dot(x[s], qv[q]));
+                if (gl_SubgroupInvocationID == 0) {
+                    partial[gl_SubgroupID][s * MAX_Q + q] = v;
+                }
+            }
+        }
+    }
+    barrier();
+
+    // the workgroup sums: one subgroup per score, its lanes add the partial sums of a strided set of subgroups
+    for (uint i = gl_SubgroupID; i < MAX_S * MAX_Q; i += gl_NumSubgroups) {
+        if (i / MAX_Q < ns && i % MAX_Q < nq) {
+            float v = 0.0f;
+            for (uint g = gl_SubgroupInvocationID; g < gl_NumSubgroups; g += gl_SubgroupSize) {
+                v += partial[g][i];
+            }
+            v = subgroupAdd(v);
+            if (gl_SubgroupInvocationID == 0) {
+                probs[i] = v * scale;
+            }
+        }
+    }
+    barrier();
+
+    if (!in_range) {
+        return;
+    }
+    // every thread takes the soft_max of the (few) scores itself, shared memory broadcasts them
+    [[unroll]] for (uint q = 0; q < MAX_Q; ++q) {
+        if (q < nq) {
+            float m = -1.0f/0.0f;
+            [[unroll]] for (uint s = 0; s < MAX_S; ++s) {
+                if (s < ns) {
+                    m = max(m, probs[s * MAX_Q + q]);
+                }
+            }
+            float sum = 0.0f;
+            vec4 o = vec4(0.0f);
+            [[unroll]] for (uint s = 0; s < MAX_S; ++s) {
+                if (s < ns) {
+                    const float e = exp(probs[s * MAX_Q + q] - m);
+                    sum += e;
+                    o += e * x[s];
+                }
+            }
+            o /= sum;
+            const uint base = d_off + q + 4 * tid * d_nb1 + t * d_nb2;
+            data_d[base]              = o.x;
+            data_d[base + d_nb1]      = o.y;
+            data_d[base + 2 * d_nb1]  = o.z;
+            data_d[base + 3 * d_nb1]  = o.w;
+        }
+    }
+}

@@ -232,6 +232,18 @@ struct vk_op_dsv4_hc_pre_push_constants {
     float scale;
 };
 
+struct vk_op_depth_mix_push_constants {
+    uint32_t n_embd;
+    uint32_t na;
+    uint32_t nb;
+    uint32_t nq;
+    uint32_t a_off; uint32_t a_nb1; uint32_t a_nb2;
+    uint32_t b_off; uint32_t b_nb1; uint32_t b_nb2;
+    uint32_t q_off; uint32_t q_nb1; uint32_t q_nb2;
+    uint32_t d_off; uint32_t d_nb1; uint32_t d_nb2;
+    float scale;
+};
+
 struct vk_op_ctrl_gate_push_constants {
     uint32_t nrows;
     uint32_t k4;
